@@ -1,0 +1,27 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model weights (large binary files - don't belong in git)
+*.pt
+*.onnx
+
+# Dataset (large, sourced separately - don't belong in git)
+data/dataset/
+data/raw_scraped/
+data/test_footage/
+
+# Event outputs (generated at runtime)
+outputs/events/*
+outputs/logs/*
+!outputs/events/.gitkeep
+!outputs/logs/.gitkeep
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
