@@ -33,7 +33,11 @@ class VideoIngestion:
         # isinstance(source, str) checks "is this a string?"
         # .startswith("rtsp://") checks if the string begins with rtsp://
         # both must be true for is_rtsp to be True
-        self.is_rtsp = isinstance(source, str) and source.startswith("rtsp://")        
+        self.is_rtsp = isinstance(source, str) and source.startswith("rtsp://")  
+
+        # True only for local video files — NOT webcam (int) and NOT rtsp.
+        # We need this to know whether "loop_file" should even apply.
+        self.is_file = isinstance(self.source, str) and not self.is_rtsp      
 
         # self.cap will hold the actual OpenCV camera/video object once opened.
         # None means "not opened yet"
@@ -134,6 +138,15 @@ class VideoIngestion:
             
             # 'if not ret:' means "if reading the frame failed"
             if not ret:
+
+                # NEW: if this is a local file, it reached its end, AND the
+                # caller explicitly asked us NOT to loop it — stop cleanly
+                # instead of reconnecting. This is the only place loop_file
+                # actually gets checked/used.
+                if self.is_file and not self.loop_file:
+                    self.running = False
+                    break   
+                
                 retries += 1  # Add 1 to our failure counter
                 
                 # Have we failed too many times? (e.g., more than 5 times)
