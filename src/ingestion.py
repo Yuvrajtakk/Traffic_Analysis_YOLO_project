@@ -1,13 +1,3 @@
-"""
-src/ingestion.py
-
-Unified, always-threaded video ingestion.
-ALL sources (webcam / file / RTSP) go through the
-SAME threaded code path — not just RTSP — so that local-file testing
-during dev actually exercises the same logic that runs against the real
-camera in production.
-"""
-
 import os
 import sys
 import threading
@@ -171,15 +161,6 @@ class VideoIngestion:
                 with self.lock:
                     self.frame = frame  # Update the shared whiteboard with the new picture
 
-        """
-        Consumer-facing method. Returns the most recent frame (or None if
-        nothing's available yet / stream has stopped). NEVER blocks.
-        """
-        # TODO: safely read self.frame under self.lock and return a COPY
-        # of it (why a copy, not the raw reference? think about what
-        # could happen if the background thread overwrites self.frame
-        # while the caller is still using what read() returned)
-        pass
 
     def read(self):
         """
@@ -199,10 +180,6 @@ class VideoIngestion:
             # .copy() creates a brand new, separate block of memory with
             # the same pixel data — NOT a reference to the same object.
             return self.frame.copy()
-
-
-        # TODO: wait for the thread to actually finish (join), then release self.cap
-
 
     def stop(self):
         """Cleanly shuts down the background thread and releases the capture."""
