@@ -27,6 +27,8 @@ STATIONARY_PIXEL_THRESHOLD = 5
 # ── Module II: Wrong-Way Detection ──────────────────────────────────
 WRONG_WAY_DURATION_SEC = 5    
 WRONG_WAY_SMOOTHING_WINDOW = 10 
+WRONG_WAY_COSINE_THRESHOLD = 0.5  # Adjust based on your needs
+AUTHORIZED_FLOW_VECTOR = (1.0, 0.0)
 
 # ── Module III: Environmental Hazards ───────────────────────────────
 HAZARD_CONFIDENCE_THRESHOLD = 0.25  
@@ -41,5 +43,5 @@ POST_EVENT_SEC = 2
 EVENT_COOLDOWN_SEC = 2  
 
 # ── Vehicle class taxonomy (used across multiple modules) ──────────
-VEHICLE_CLASSES = ['car','bike', 'bus']   
-HAZARD_CLASSES = ['fire','smoke','accident']    
+VEHICLE_CLASSES = ['Car','Bike', 'Bus']   
+HAZARD_CLASSES = ['Fire','Smoke','Accident']    
