@@ -104,7 +104,7 @@ class HazardDetector:
                     # cooldown, same pattern as the other two modules,
                     # so we don't fire a new event every single frame
                     # while the hazard remains visible.
-                    last_time = self.last_triggered.get(cls, 0)
+                    last_time = self.last_triggered.get(cls, float("-inf"))
                     if timestamp - last_time >= EVENT_COOLDOWN_SEC:
                         det = seen_this_frame[cls]
                         event = {

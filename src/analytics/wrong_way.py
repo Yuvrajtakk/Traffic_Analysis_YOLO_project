@@ -158,7 +158,7 @@ class WrongWayDetector:
                     # cooldown, same pattern as stationary.py, so we
                     # don't fire a new event every single frame while
                     # the violation continues.
-                    last_time = self.last_triggered.get(track_id, 0)
+                    last_time = self.last_triggered.get(track_id, float("-inf"))
                     if timestamp - last_time >= EVENT_COOLDOWN_SEC:
                         event = {
                             "id": track_id,

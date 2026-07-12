@@ -126,7 +126,7 @@ class StationaryDetector:
                 # Cooldown check: has this exact ID already fired an
                 # event recently? If so, don't spam another one every
                 # single frame while it remains stationary.
-                last_time = self.last_triggered.get(track_id, 0)
+                last_time = self.last_triggered.get(track_id, float("-inf"))
                 if (timestamp - last_time) < EVENT_COOLDOWN_SEC:
                     continue
 

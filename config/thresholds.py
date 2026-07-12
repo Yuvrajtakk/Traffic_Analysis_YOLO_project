@@ -35,7 +35,17 @@ HAZARD_CONFIDENCE_THRESHOLD = 0.25
 HAZARD_PERSISTENCE_SEC = 1        
 
 # ── Module IV: Congestion / Density ─────────────────────────────────
-CONGESTION_CAPACITY = 5   
+CONGESTION_CAPACITY = 5  
+# Default ROI polygon in NORMALIZED (0-1) image coordinates — a rough
+# placeholder covering most of the frame. Real deployment requires
+# manually tracing the actual road boundary for each specific camera
+# (see congestion.py's KNOWN LIMITATION note).
+CONGESTION_ROI_POLYGON_NORM = [
+    (0.05, 0.35),
+    (0.95, 0.35),
+    (0.95, 0.95),
+    (0.05, 0.95),
+] 
 
 # ── Event Recording ──────────────────────────────────────────────────
 PRE_EVENT_SEC = 2    
