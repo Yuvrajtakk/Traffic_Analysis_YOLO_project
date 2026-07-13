@@ -17,8 +17,8 @@ class VideoIngestion:
         """
         source: int (webcam index), or str (file path OR rtsp:// / http:// URL)
         loop_file: if True, local video files restart from frame 0 on EOF
-                   instead of stopping (keeps threaded logic path consistent
-                   for both files and live streams)
+        instead of stopping (keeps threaded logic path consistent
+        for both files and live streams)
         """
         self.raw_source = source
 
