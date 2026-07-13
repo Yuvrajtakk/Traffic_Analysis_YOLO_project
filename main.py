@@ -53,6 +53,27 @@ def build_status_text(module_state):
     return " ".join(status_parts)
 
 
+def should_quit(key, window_name):
+    if key == ord("q"):
+        return True
+
+    try:
+        return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return False
+
+
+def resize_frame_for_display(frame, max_width=1280, max_height=720):
+    height, width = frame.shape[:2]
+    if width <= max_width and height <= max_height:
+        return frame
+
+    scale = min(max_width / width, max_height / height)
+    new_width = max(1, int(width * scale))
+    new_height = max(1, int(height * scale))
+    return cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+
 def main():
     # ================= PIECE 1: build every module =================
     # VideoIngestion opens the source and starts its background thread
@@ -180,12 +201,13 @@ def main():
             (0, 255, 0),
             2,
         )
-        cv2.imshow(window_name, frame)
+        display_frame = resize_frame_for_display(frame)
+        cv2.imshow(window_name, display_frame)
 
         # waitKey(1) pauses 1ms AND tells us which key was pressed —
         # also what actually makes the window repaint on screen
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
+        if should_quit(key, window_name):
             break
         if key in KEY_TOGGLE_MAP:
             toggle_module_state(module_state, key)
