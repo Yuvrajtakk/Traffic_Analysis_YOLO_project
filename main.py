@@ -4,7 +4,7 @@ main.py
 Wires every built module into one real-time loop:
 ingestion -> tracker -> TrackManager -> 4 analytics modules -> event_recorder -> display.
 
-The trackbars gate whether each analytics module's check() is even
+Keyboard toggles gate whether each analytics module's check() is even
 CALLED this frame — not just whether its output is shown. Turning a
 switch OFF genuinely skips that module's work entirely.
 """
@@ -25,12 +25,32 @@ from src.event_recorder import EventRecorder
 SOURCE = "data/test_footage/sample.mp4"
 WEIGHTS = "models/weights/best.pt"
 
+MODULE_ORDER = (
+    ("stationary", "S"),
+    ("wrong_way", "W"),
+    ("hazards", "H"),
+    ("congestion", "C"),
+)
+KEY_TOGGLE_MAP = {
+    ord("s"): "stationary",
+    ord("w"): "wrong_way",
+    ord("h"): "hazards",
+    ord("c"): "congestion",
+}
 
-def nothing(x):
-    """OpenCV forces every trackbar to have a callback function, even
-    one that does nothing. We read the slider ourselves every frame
-    inside the loop instead — this exists only to satisfy that rule."""
-    pass
+
+def toggle_module_state(module_state, key):
+    module_name = KEY_TOGGLE_MAP.get(key)
+    if module_name is None:
+        return
+    module_state[module_name] = not module_state[module_name]
+
+
+def build_status_text(module_state):
+    status_parts = []
+    for module_name, label in MODULE_ORDER:
+        status_parts.append(f"{label}:{'ON' if module_state[module_name] else 'OFF'}")
+    return " ".join(status_parts)
 
 
 def main():
@@ -73,26 +93,17 @@ def main():
 
     event_recorder = EventRecorder()
 
-    # ================= PIECE 2: window + trackbars =================
+    # ================= PIECE 2: window + keyboard toggles =================
     window_name = "Traffic Dashboard"
+    module_state = {
+        "stationary": True,
+        "wrong_way": True,
+        "hazards": True,
+        "congestion": True,
+    }
     cv2.namedWindow(window_name)
 
-    # max_value=1 turns a slider into a fake ON/OFF switch — it can
-    # only ever sit at 0 or 1, nowhere in between. All start at 1 (ON)
-    # so the very first frame shown already has everything working.
-    cv2.createTrackbar("Stationary", window_name, 1, 1, nothing)
-    cv2.createTrackbar("Wrong-Way", window_name, 1, 1, nothing)
-    cv2.createTrackbar("Hazards", window_name, 1, 1, nothing)
-    cv2.createTrackbar("Congestion", window_name, 1, 1, nothing)
-
     # ================= PIECE 3-7: the real-time loop =================
-    cv2.createTrackbar("Congestion", window_name, 1, 1, nothing)
-
-    cv2.waitKey(1)   # <-- ADD THIS. Gives Windows one tick to actually
-                      # finish realizing the window before we start
-                      # asking it for trackbar positions.
-
-
     while True:
         frame = cap.read()
         if frame is None:
@@ -107,7 +118,7 @@ def main():
         detections = tracker.track(frame)
         track_manager.update(detections, timestamp=now)
 
-        # ---- Piece 5: trackbar-gated analytics checks ----
+        # ---- Piece 5: keyboard-toggle-gated analytics checks ----
         # start every result as an empty list FIRST. That way "switch
         # was OFF" and "switch was ON but nothing triggered" look
         # exactly the same to the code below — always a list, never
@@ -117,19 +128,19 @@ def main():
         hazard_events = []
         congestion_events = []
 
-        if cv2.getTrackbarPos("Stationary", window_name) == 1:
+        if module_state["stationary"]:
             stationary_events = stationary_detector.check(timestamp=now)
 
-        if cv2.getTrackbarPos("Wrong-Way", window_name) == 1:
+        if module_state["wrong_way"]:
             wrong_way_events = wrong_way_detector.check(timestamp=now)
 
-        if cv2.getTrackbarPos("Hazards", window_name) == 1:
+        if module_state["hazards"]:
             # only this one needs the raw detections list — it has no
             # TrackManager, no history, it just reads what YOLO saw
             # THIS frame, directly
             hazard_events = hazard_detector.check(detections, timestamp=now)
 
-        if cv2.getTrackbarPos("Congestion", window_name) == 1:
+        if module_state["congestion"]:
             congestion_events = congestion_detector.check(timestamp=now)
 
         # ---- Piece 6: hand fired events to event_recorder ----
@@ -160,13 +171,24 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
             )
 
+        cv2.putText(
+            frame,
+            build_status_text(module_state),
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
         cv2.imshow(window_name, frame)
 
         # waitKey(1) pauses 1ms AND tells us which key was pressed —
         # also what actually makes the window repaint on screen
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        if key == ord("q"):
             break
+        if key in KEY_TOGGLE_MAP:
+            toggle_module_state(module_state, key)
 
     # ================= cleanup — runs ONCE, after break =================
     cap.stop()
