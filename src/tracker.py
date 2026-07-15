@@ -20,17 +20,19 @@ from config.thresholds import TRACK_BUFFER_FRAMES, DEFAULT_FPS
 
 
 class YOLOTracker:
-    def __init__(self, weights_path, confidence_threshold=0.4, device="cpu"):
+    def __init__(self, weights_path, confidence_threshold=0.4, device="cpu", imgsz=1280):
         """
         weights_path: path to a .pt file (e.g. "models/weights/yolov8s_coco_stock.pt")
         confidence_threshold: ignore any detection below this confidence
         device: "cpu" or "0" (GPU index)
+        imgsz: image size used for YOLO inference
         """
         # Loads the model's weights from disk into memory, ready to run.
         self.model = YOLO(weights_path)
 
         self.confidence_threshold = confidence_threshold
         self.device = device
+        self.imgsz = imgsz
 
     def track(self, frame):
         """
@@ -46,6 +48,7 @@ class YOLOTracker:
         # and every object would get a brand new ID every single frame.
         results = self.model.track(
             frame,
+            imgsz=self.imgsz,
             conf=self.confidence_threshold,
             device=self.device,
             tracker="bytetrack.yaml",

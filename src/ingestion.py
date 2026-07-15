@@ -9,7 +9,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from config.thresholds import RECONNECT_MAX_RETRIES, RECONNECT_DELAY_SEC
+from config.thresholds import RECONNECT_MAX_RETRIES, RECONNECT_DELAY_SEC, DEFAULT_FPS
 
 
 class VideoIngestion:
@@ -56,6 +56,10 @@ class VideoIngestion:
 
         # will hold the actual background worker (the Thread object) once started
         self.thread = None  #The dedicated process that handles video capture independently.
+        # For local file playback pacing (None for webcam/RTSP)
+        self.source_frame_interval = None
+        # Wall-clock time of the last successful read (used only for local files)
+        self._last_read_time = None
 
     
     def _open_capture(self):
@@ -86,7 +90,22 @@ class VideoIngestion:
         # If not, crash loudly and tell us why, rather than failing silently later.
         if not cap.isOpened():
             raise RuntimeError(f"Could not open source: {self.raw_source}")
-            
+        # For local files, read the file's FPS and compute the per-frame interval
+        if self.is_file:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            try:
+                fps_val = float(fps)
+            except Exception:
+                fps_val = 0.0
+
+            if fps_val and fps_val > 0:
+                self.source_frame_interval = 1.0 / fps_val
+            else:
+                self.source_frame_interval = 1.0 / DEFAULT_FPS
+        else:
+            # For webcam or RTSP streams, do not throttle
+            self.source_frame_interval = None
+
         # Hand back the successfully opened video object
         return cap
 
@@ -157,18 +176,36 @@ class VideoIngestion:
                 # Wait a moment (e.g., 1 second) before trying again
                 time.sleep(RECONNECT_DELAY_SEC) 
                 
-                # Close the broken connection and try opening it again
+                # Close the broken connection and try opening it again.
+                # Wrapped in try/except: _open_capture() raises RuntimeError
+                # immediately if the source is genuinely unreachable (e.g.
+                # RTSP still down). Without this catch, that exception used
+                # to kill this whole background thread on the FIRST failed
+                # reconnect attempt, bypassing RECONNECT_MAX_RETRIES entirely.
+                # Catching it here lets the retry counter above actually do
+                # its job across multiple attempts, same as originally intended.
                 self.cap.release()
-                self.cap = self._open_capture()
+                try:
+                    self.cap = self._open_capture()
+                except RuntimeError:
+                    continue
                 
-                # 'continue' means "skip the rest of the code below and 
-                # jump right back to the top of the 'while' loop to try again"
                 continue
                 
             # If we get here, we successfully got a frame!
             else:
                 retries = 0  # Reset our failure counter back to 0
-                
+                # Throttle local file playback to the source video's own FPS
+                if self.source_frame_interval is not None:
+                    now = time.time()
+                    if self._last_read_time is not None:
+                        elapsed = now - self._last_read_time
+                        remaining = self.source_frame_interval - elapsed
+                        if remaining > 0:
+                            time.sleep(remaining)
+                    # Update last read time after possible sleep
+                    self._last_read_time = time.time()
+
                 # Use the lock. This says "Hey main program, don't read the 
                 # whiteboard while I am currently erasing and redrawing it!"
                 with self.lock:
@@ -184,10 +221,13 @@ class VideoIngestion:
         # whiteboard while someone else might be mid-write to it.
         with self.lock:
 
-            # If the background thread hasn't successfully read a single
-            # frame yet (e.g. we just called start() a millisecond ago),
-            # self.frame is still None. Just say so honestly.
-            if self.frame is None:
+            # If the background thread has given up entirely (retries
+            # exhausted, self.running flipped False), stop handing out
+            # the last cached frame as if it were still live — that
+            # silently freezes analytics on a still image forever,
+            # which looks to every downstream module like every vehicle
+            # in frame simultaneously stopped moving.
+            if not self.running or self.frame is None:
                 return None
 
             # .copy() creates a brand new, separate block of memory with

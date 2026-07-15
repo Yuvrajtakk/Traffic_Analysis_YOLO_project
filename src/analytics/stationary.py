@@ -15,8 +15,9 @@ import time
 from config.thresholds import (
     STATIONARY_DURATION_SEC,
     STATIONARY_PIXEL_THRESHOLD,
+    STATIONARY_AREA_CHANGE_THRESHOLD,
+    DEBUG,
     VEHICLE_CLASSES,
-    EVENT_COOLDOWN_SEC,
 )
 
 
@@ -28,13 +29,12 @@ class StationaryDetector:
         # never disagree about whether a given ID is still "alive."
         self.track_manager = track_manager
 
-        # Remembers "the last time we fired a stationary event for this
-        # ID" — a simple dictionary, keyed by track_id, same shape as
-        # TrackManager's own self.tracks. Without this, a car that's
-        # been stationary for 30 seconds would fire a NEW event every
-        # single frame for all 30 seconds, flooding outputs/events/
-        # with near-duplicate clips.
-        self.last_triggered = {}
+        # Keyed by track_id -> the centroid position and area at the moment
+        # this incident fired. Using an anchor point (not a set) lets us
+        # check "has it actually moved away from where it stopped" going
+        # forward, instead of re-deriving that from the same noisy sliding
+        # window that caused the false re-fires.
+        self.currently_stationary = {}
 
     def _get_centroid(self, bbox):
         """bbox is (x1, y1, x2, y2). Return (cx, cy) — the box's center."""
@@ -63,6 +63,12 @@ class StationaryDetector:
             timestamp = time.time()
 
         events = []
+
+        # Drop any track_ids that no longer exist in TrackManager at all.
+        live_ids = set(self.track_manager.tracks.keys())
+        for stale_id in list(self.currently_stationary.keys()):
+            if stale_id not in live_ids:
+                del self.currently_stationary[stale_id]
 
         # DESIGN DECISION: we loop over tracks.keys(), NOT
         # get_active_ids(). get_active_ids() only returns IDs seen in
@@ -93,6 +99,19 @@ class StationaryDetector:
                 if timestamp - entry[0] <= STATIONARY_DURATION_SEC
             ]
 
+            # Quick, gated diagnostic for each track's sliding window.
+            # Runs only when DEBUG is True so normal operation is
+            # unaffected. Computes a temporary max-distance in the
+            # same way the main logic would (only for reporting).
+            if DEBUG:
+                oldest_age = (timestamp - window[0][0]) if window else None
+                if len(window) >= 2:
+                    centroids_tmp = [self._get_centroid(entry[1]) for entry in window]
+                    max_dist_tmp = max(self._distance(centroids_tmp[0], c) for c in centroids_tmp)
+                else:
+                    max_dist_tmp = "N/A"
+                print(f"[stationary-debug] id={track_id} class={info['class_name']} window_len={len(window)} oldest_age={oldest_age} max_distance={max_dist_tmp}")
+
             # Guard 1: need at least 2 points to measure any movement
             # at all — a single point can't prove "stayed still."
             if len(window) < 2:
@@ -116,29 +135,54 @@ class StationaryDetector:
             max_distance = max(
                 self._distance(centroids[0], c) for c in centroids
             )
+            areas = [
+                (entry[1][2] - entry[1][0]) * (entry[1][3] - entry[1][1])
+                for entry in window
+            ]
+            base_area = areas[0]
+            if base_area > 0:
+                max_area_ratio_change = max(
+                    abs(a - base_area) / base_area for a in areas
+                )
+            else:
+                max_area_ratio_change = 0.0
 
             # Only vehicles that barely moved get considered further.
             # Everything below this line is INSIDE this if-block on
             # purpose — a moving vehicle must never reach the event-
             # firing code at all.
-            if max_distance <= STATIONARY_PIXEL_THRESHOLD:
+            current_centroid = centroids[-1]
 
-                # Cooldown check: has this exact ID already fired an
-                # event recently? If so, don't spam another one every
-                # single frame while it remains stationary.
-                last_time = self.last_triggered.get(track_id, float("-inf"))
-                if (timestamp - last_time) < EVENT_COOLDOWN_SEC:
-                    continue
+            if track_id in self.currently_stationary:
+                # Already fired for this incident. Only clear it if the
+                # vehicle has genuinely moved away from the ANCHOR point
+                # recorded at fire-time — not based on the window's own
+                # max_distance, which can be corrupted by a single stale
+                # jitter frame still sitting in the 5-second lookback.
+                anchor_centroid, anchor_area = self.currently_stationary[track_id]
+                current_area = areas[-1]
+                area_ratio_change = (
+                    abs(current_area - anchor_area) / anchor_area
+                    if anchor_area > 0 else 0.0
+                )
+                if (
+                    self._distance(current_centroid, anchor_centroid) > STATIONARY_PIXEL_THRESHOLD
+                    or area_ratio_change > STATIONARY_AREA_CHANGE_THRESHOLD
+                ):
+                    del self.currently_stationary[track_id]
+                continue
 
-                # Passed every check: genuinely stationary, and not on
-                # cooldown. Build the event and remember we fired it.
+            if max_distance <= STATIONARY_PIXEL_THRESHOLD and max_area_ratio_change <= STATIONARY_AREA_CHANGE_THRESHOLD:
+                # Not yet fired for this incident, and the window
+                # confirms it's genuinely been still — fire once, and
+                # anchor future re-checks to THIS position.
                 event = {
                     "id": track_id,
                     "class_name": info["class_name"],
-                    "bbox": info["history"][-1][1],  # most recent bbox
+                    "bbox": info["history"][-1][1],
                     "timestamp": timestamp,
                 }
                 events.append(event)
-                self.last_triggered[track_id] = timestamp
+                self.currently_stationary[track_id] = (current_centroid, areas[-1])
 
         return events

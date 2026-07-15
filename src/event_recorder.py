@@ -99,7 +99,11 @@ class EventRecorder:
 
         # Step A: save the annotated frame as a still image right now.
         # Fast (milliseconds) — no threading needed for a single image.
-        filename = f"{event_type}_{int(timestamp)}.jpg"
+        # Use the full fractional timestamp so two events that happen
+        # within the same second are still captured as distinct files.
+        safe_timestamp = str(timestamp).replace(".", "_")
+        track_id_str = metadata.get("id", "NA")
+        filename = f"{event_type}_id{track_id_str}_{safe_timestamp}.jpg"
         cv2.imwrite(os.path.join(self.output_dir, filename), frame)
 
         # Step B: snapshot the CURRENT rolling buffer as this event's

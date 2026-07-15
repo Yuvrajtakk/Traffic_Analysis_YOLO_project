@@ -22,7 +22,7 @@ from src.analytics.congestion import CongestionDetector
 from src.event_recorder import EventRecorder
 
 
-SOURCE = "data/test_footage/sample.mp4"
+SOURCE = "rtsp://10.103.135.2:1945/" #" data/test_footage/sample.mp4"
 WEIGHTS = "models/weights/best.pt"
 
 MODULE_ORDER = (

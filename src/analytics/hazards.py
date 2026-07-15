@@ -26,7 +26,7 @@ from config.thresholds import (
     HAZARD_CLASSES,
     HAZARD_CONFIDENCE_THRESHOLD,
     HAZARD_PERSISTENCE_SEC,
-    EVENT_COOLDOWN_SEC,
+    HAZARD_EVENT_COOLDOWN_SEC,
 )
 
 
@@ -105,7 +105,7 @@ class HazardDetector:
                     # so we don't fire a new event every single frame
                     # while the hazard remains visible.
                     last_time = self.last_triggered.get(cls, float("-inf"))
-                    if timestamp - last_time >= EVENT_COOLDOWN_SEC:
+                    if timestamp - last_time >= HAZARD_EVENT_COOLDOWN_SEC:
                         det = seen_this_frame[cls]
                         event = {
                             "class_name": cls,

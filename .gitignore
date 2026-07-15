@@ -24,4 +24,9 @@ outputs/logs/*
 # OS/editor junk
 .DS_Store
 Thumbs.db
+tempCodeRunnerFile.py
 .vscode/
+debug_*.py
+debug_frames/
+debug_frames_validation/
+debug_frames_validation_person/
