@@ -7,6 +7,14 @@ ingestion -> tracker -> TrackManager -> 4 analytics modules -> event_recorder ->
 Keyboard toggles gate whether each analytics module's check() is even
 CALLED this frame — not just whether its output is shown. Turning a
 switch OFF genuinely skips that module's work entirely.
+
+NEW THIS PHASE: a shared LiveConfig object (config/live_config.py) is
+created once here and passed into YOLOTracker and all four analytics
+detectors. A TuningPanel (src/tuning_panel.py) opens a second window
+of trackbars that write straight into that same LiveConfig object —
+every threshold on the panel takes effect on the very next frame, no
+restart needed. Press 'p' any time to print the current tuning to the
+console in a paste-ready format for thresholds.py.
 """
 
 import time
@@ -20,10 +28,13 @@ from src.analytics.wrong_way import WrongWayDetector
 from src.analytics.hazards import HazardDetector
 from src.analytics.congestion import CongestionDetector
 from src.event_recorder import EventRecorder
+from config.live_config import LiveConfig
+from src.tuning_panel import TuningPanel
 
 
-SOURCE = "rtsp://10.103.135.2:1945/" #" data/test_footage/sample.mp4"
-WEIGHTS = "models/weights/best.pt"
+SOURCE = "rtsp://10.158.78.2:1945/"
+WEIGHTS = "models/weights/new_best.pt"
+
 
 MODULE_ORDER = (
     ("stationary", "S"),
@@ -75,6 +86,12 @@ def resize_frame_for_display(frame, max_width=1280, max_height=720):
 
 
 def main():
+    # ================= PIECE 0: shared live-tunable config ==========
+    # ONE LiveConfig instance, passed into the tracker, every analytics
+    # detector, and the tuning panel — this is what lets one trackbar
+    # move affect every module that cares about that value, instantly.
+    config = LiveConfig()
+
     # ================= PIECE 1: build every module =================
     # VideoIngestion opens the source and starts its background thread
     # immediately. From this point on, cap.read() always gives us
@@ -83,19 +100,21 @@ def main():
 
     # YOLOTracker has no .start() — the model is fully loaded into
     # memory the instant __init__ finishes. Nothing left to "start."
-    tracker = YOLOTracker(weights_path=WEIGHTS)
+    # imgsz now defaults to MODEL_IMGSZ (960) from thresholds.py,
+    # matching the resolution new_best.pt was actually trained at.
+    tracker = YOLOTracker(weights_path=WEIGHTS, config=config)
 
     # ONE shared TrackManager — every analytics module below reads
     # from this SAME object, so none of them can ever disagree about
     # whether a given ID is still "alive."
     track_manager = TrackManager()
 
-    # PRIME THE FRAME: CongestionDetector needs real frame_width and
-    # frame_height to build its ROI polygon, and those numbers don't
-    # exist until we've actually read one real frame. Keep asking
-    # cap.read() until it stops returning None. This also guarantees
-    # every frame we touch from here on is real, valid image data —
-    # never garbage, never corrupted.
+    # PRIME THE FRAME: CongestionDetector and WrongWayDetector both
+    # need real frame_width and frame_height to build their ROI/zone
+    # polygons, and those numbers don't exist until we've actually
+    # read one real frame. Keep asking cap.read() until it stops
+    # returning None. This also guarantees every frame we touch from
+    # here on is real, valid image data — never garbage, never corrupted.
     first_frame = None
     while first_frame is None:
         first_frame = cap.read()
@@ -106,15 +125,16 @@ def main():
     frame_height, frame_width = first_frame.shape[:2]
 
     # Build the four analytics detectors — only NOW, after
-    # frame_width/frame_height actually exist.
-    stationary_detector = StationaryDetector(track_manager)
-    wrong_way_detector = WrongWayDetector(track_manager)
-    hazard_detector = HazardDetector()  # no track_manager — works off raw detections directly
-    congestion_detector = CongestionDetector(track_manager, frame_width, frame_height)
+    # frame_width/frame_height actually exist. All four now also take
+    # the shared `config` for live-tunable thresholds.
+    stationary_detector = StationaryDetector(track_manager, config)
+    wrong_way_detector = WrongWayDetector(track_manager, config, frame_width, frame_height)
+    hazard_detector = HazardDetector(config)  # no track_manager — works off raw detections directly
+    congestion_detector = CongestionDetector(track_manager, frame_width, frame_height, config)
 
     event_recorder = EventRecorder()
 
-    # ================= PIECE 2: window + keyboard toggles =================
+    # ================= PIECE 2: windows + keyboard toggles ==========
     window_name = "Traffic Dashboard"
     module_state = {
         "stationary": True,
@@ -123,6 +143,10 @@ def main():
         "congestion": True,
     }
     cv2.namedWindow(window_name)
+
+    # Opens the second "Tuning Panel" window with every live-tunable
+    # trackbar wired straight into `config` — see src/tuning_panel.py.
+    tuning_panel = TuningPanel(config)
 
     # ================= PIECE 3-7: the real-time loop =================
     while True:
@@ -211,6 +235,11 @@ def main():
             break
         if key in KEY_TOGGLE_MAP:
             toggle_module_state(module_state, key)
+        if key == ord("p"):
+            # Print the current live tuning to the console — a
+            # paste-ready snapshot for thresholds.py once a tuning
+            # session finds values worth keeping permanently.
+            tuning_panel.print_snapshot()
 
     # ================= cleanup — runs ONCE, after break =================
     cap.stop()

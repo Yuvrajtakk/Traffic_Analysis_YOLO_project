@@ -16,21 +16,29 @@ import time
 
 from ultralytics import YOLO
 
-from config.thresholds import TRACK_BUFFER_FRAMES, DEFAULT_FPS
+from config.thresholds import TRACK_BUFFER_FRAMES, DEFAULT_FPS, MODEL_IMGSZ
 
 
 class YOLOTracker:
-    def __init__(self, weights_path, confidence_threshold=0.4, device="cpu", imgsz=1280):
+    def __init__(self, weights_path, config, device="cpu", imgsz=MODEL_IMGSZ):
         """
-        weights_path: path to a .pt file (e.g. "models/weights/yolov8s_coco_stock.pt")
-        confidence_threshold: ignore any detection below this confidence
+        weights_path: path to a .pt file (e.g. "models/weights/new_best.pt")
+        config: the shared LiveConfig instance — confidence threshold
+            is read from config.YOLO_CONFIDENCE_THRESHOLD fresh every
+            frame in track(), NOT cached here, so the tuning panel's
+            "YOLO Conf" trackbar takes effect live, no restart needed.
         device: "cpu" or "0" (GPU index)
-        imgsz: image size used for YOLO inference
+        imgsz: image size used for YOLO inference. Defaults to
+            MODEL_IMGSZ from thresholds.py (960), which MUST match
+            whatever resolution the weights were actually trained at —
+            v2_960_100epoch_real trained at imgsz=960. Running
+            inference at a different size doesn't error, it just
+            quietly costs accuracy.
         """
         # Loads the model's weights from disk into memory, ready to run.
         self.model = YOLO(weights_path)
 
-        self.confidence_threshold = confidence_threshold
+        self.config = config
         self.device = device
         self.imgsz = imgsz
 
@@ -46,10 +54,14 @@ class YOLOTracker:
         # persist=True is REQUIRED — it tells ByteTrack "remember previous
         # frames' tracks," otherwise every frame starts fresh with no memory,
         # and every object would get a brand new ID every single frame.
+        #
+        # conf is read from self.config FRESH every call, not cached at
+        # __init__ — this is what makes the tuning panel's confidence
+        # slider actually take effect while the program is running.
         results = self.model.track(
             frame,
             imgsz=self.imgsz,
-            conf=self.confidence_threshold,
+            conf=self.config.YOLO_CONFIDENCE_THRESHOLD,
             device=self.device,
             tracker="bytetrack.yaml",
             persist=True,

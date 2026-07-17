@@ -11,6 +11,10 @@ detections (straight from YOLOTracker.track()), checking: has a given
 hazard CLASS been seen, confidently, in EVERY frame continuously for at
 least HAZARD_PERSISTENCE_SEC?
 
+LIVE TUNING: HAZARD_CONFIDENCE_THRESHOLD and HAZARD_PERSISTENCE_SEC are
+read from the shared LiveConfig object (self.config) fresh every
+check() call — see config/live_config.py.
+
 KNOWN LIMITATION: persistence requires a detection in literally every
 processed frame with no gaps — a single missed/low-confidence frame due
 to detector flicker resets the streak entirely, even if the underlying
@@ -22,19 +26,20 @@ building the simple strict version first.
 
 import time
 
-from config.thresholds import (
-    HAZARD_CLASSES,
-    HAZARD_CONFIDENCE_THRESHOLD,
-    HAZARD_PERSISTENCE_SEC,
-    HAZARD_EVENT_COOLDOWN_SEC,
-)
+from config.thresholds import HAZARD_CLASSES, HAZARD_EVENT_COOLDOWN_SEC
 
 
 class HazardDetector:
-    def __init__(self):
+    def __init__(self, config):
         # NOTE: no track_manager parameter here at all — this module
         # doesn't need shared position history, just raw per-frame
         # detections handed to check() directly.
+
+        # The SAME LiveConfig instance every other tunable module reads
+        # from. Never cache HAZARD_CONFIDENCE_THRESHOLD or
+        # HAZARD_PERSISTENCE_SEC out of this in __init__ — always read
+        # fresh inside check() so the tuning panel takes effect live.
+        self.config = config
 
         # Keyed by CLASS NAME (e.g. "Fire"), not by track_id — the key
         # difference from stationary/wrong_way's per-ID dicts. Value =
@@ -57,6 +62,11 @@ class HazardDetector:
         if timestamp is None:
             timestamp = time.time()
 
+        # Read both tunables once per call — see stationary.py's same
+        # comment for why (consistency within this one pass).
+        hazard_confidence_threshold = self.config.HAZARD_CONFIDENCE_THRESHOLD
+        hazard_persistence_sec = self.config.HAZARD_PERSISTENCE_SEC
+
         events = []
 
         # STEP A — figure out which hazard classes were genuinely,
@@ -73,7 +83,7 @@ class HazardDetector:
             # Is a hazard class, but YOLO isn't confident enough about
             # it — could easily be a false positive (red truck, sunset
             # glare mistaken for fire). Not trustworthy enough, skip.
-            if det["confidence"] < HAZARD_CONFIDENCE_THRESHOLD:
+            if det["confidence"] < hazard_confidence_threshold:
                 continue
 
             # Passed both checks — record it. If the SAME hazard class
@@ -99,7 +109,7 @@ class HazardDetector:
                 # from the moment the streak started?
                 duration = timestamp - self.hazard_since[cls]
 
-                if duration >= HAZARD_PERSISTENCE_SEC:
+                if duration >= hazard_persistence_sec:
                     # Persisted long enough — but still respect
                     # cooldown, same pattern as the other two modules,
                     # so we don't fire a new event every single frame

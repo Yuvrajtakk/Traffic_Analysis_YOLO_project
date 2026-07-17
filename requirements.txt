@@ -1,5 +1,17 @@
-ultralytics>=8.1.0
-opencv-python>=4.11.0
-numpy>=1.24.0
-lapx>=0.5.5
-filterpy>=1.4.5
+# Runtime dependencies for the live inference pipeline (main.py).
+# Training/dataset-download dependencies (roboflow) are NOT included
+# here on purpose — those only run in Colab during training, never on
+# the machine that runs main.py against the RTSP feed.
+
+ultralytics>=8.4.0
+opencv-python>=4.10.0
+numpy>=1.26.0
+
+# NOTE: do not also install opencv-python-headless in this same venv.
+# ultralytics/roboflow's dependency chains sometimes pull it in
+# silently, and it SILENTLY breaks cv2.namedWindow/imshow/waitKey with
+# a "Rebuild the library with Windows, GTK+ 2.x or Cocoa support" error
+# — no GUI backend is compiled into the headless build. If main.py
+# ever throws that error again:
+#   pip uninstall opencv-python-headless opencv-python opencv-contrib-python -y
+#   pip install opencv-python

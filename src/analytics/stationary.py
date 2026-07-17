@@ -8,26 +8,32 @@ pixel tolerance for a continuous window of STATIONARY_DURATION_SEC,
 using the shared TrackManager's per-ID history — NOT a private copy of
 position data, so this module can never disagree with wrong_way.py or
 congestion.py about whether a given ID is still "the same object."
+
+LIVE TUNING: STATIONARY_DURATION_SEC, STATIONARY_PIXEL_THRESHOLD, and
+STATIONARY_AREA_CHANGE_THRESHOLD are now read from the shared
+LiveConfig object (self.config) fresh every check() call, instead of
+being frozen module-level constants — this is what lets the trackbar
+panel change behavior while the program is running, no restart needed.
 """
 
 import time
 
-from config.thresholds import (
-    STATIONARY_DURATION_SEC,
-    STATIONARY_PIXEL_THRESHOLD,
-    STATIONARY_AREA_CHANGE_THRESHOLD,
-    DEBUG,
-    VEHICLE_CLASSES,
-)
+from config.thresholds import DEBUG, VEHICLE_CLASSES
 
 
 class StationaryDetector:
-    def __init__(self, track_manager):
+    def __init__(self, track_manager, config):
         # The SAME TrackManager instance every other module reads from.
         # We never keep our own private copy of position history — this
         # guarantees stationary.py, wrong_way.py, and congestion.py can
         # never disagree about whether a given ID is still "alive."
         self.track_manager = track_manager
+
+        # The SAME LiveConfig instance every other tunable module reads
+        # from — see config/live_config.py. Never cache a threshold
+        # value out of this into a local variable in __init__; always
+        # read self.config.SOMETHING fresh inside check() below.
+        self.config = config
 
         # Keyed by track_id -> the centroid position and area at the moment
         # this incident fired. Using an anchor point (not a set) lets us
@@ -62,6 +68,15 @@ class StationaryDetector:
         if timestamp is None:
             timestamp = time.time()
 
+        # Read every tunable value ONCE at the top of this call —
+        # not because they can't change mid-call (nothing else in this
+        # single-threaded check() would change them), but so every
+        # comparison below is guaranteed consistent within this one
+        # pass, even if the trackbar moves again right after.
+        stationary_duration_sec = self.config.STATIONARY_DURATION_SEC
+        stationary_pixel_threshold = self.config.STATIONARY_PIXEL_THRESHOLD
+        stationary_area_change_threshold = self.config.STATIONARY_AREA_CHANGE_THRESHOLD
+
         events = []
 
         # Drop any track_ids that no longer exist in TrackManager at all.
@@ -85,7 +100,7 @@ class StationaryDetector:
             info = self.track_manager.tracks[track_id]
 
             # Not this module's job — stationary PEOPLE aren't tracked
-            # here, only vehicles (Bus/Car/Bike, per VEHICLE_CLASSES).
+            # here, only vehicles (Car/Bike/Bus/Truck, per VEHICLE_CLASSES).
             if info["class_name"] not in VEHICLE_CLASSES:
                 continue
 
@@ -96,7 +111,7 @@ class StationaryDetector:
             # to decide what's still "recent enough" to matter.
             window = [
                 entry for entry in history
-                if timestamp - entry[0] <= STATIONARY_DURATION_SEC
+                if timestamp - entry[0] <= stationary_duration_sec
             ]
 
             # Quick, gated diagnostic for each track's sliding window.
@@ -123,7 +138,7 @@ class StationaryDetector:
             # "stationary for 5 seconds." The *0.9 gives a little grace
             # instead of demanding an exact 5.000-second match.
             oldest_timestamp = window[0][0]
-            if (timestamp - oldest_timestamp) < STATIONARY_DURATION_SEC * 0.9:
+            if (timestamp - oldest_timestamp) < stationary_duration_sec * 0.9:
                 continue
 
             # Convert every (timestamp, bbox) in the window into just
@@ -166,13 +181,13 @@ class StationaryDetector:
                     if anchor_area > 0 else 0.0
                 )
                 if (
-                    self._distance(current_centroid, anchor_centroid) > STATIONARY_PIXEL_THRESHOLD
-                    or area_ratio_change > STATIONARY_AREA_CHANGE_THRESHOLD
+                    self._distance(current_centroid, anchor_centroid) > stationary_pixel_threshold
+                    or area_ratio_change > stationary_area_change_threshold
                 ):
                     del self.currently_stationary[track_id]
                 continue
 
-            if max_distance <= STATIONARY_PIXEL_THRESHOLD and max_area_ratio_change <= STATIONARY_AREA_CHANGE_THRESHOLD:
+            if max_distance <= stationary_pixel_threshold and max_area_ratio_change <= stationary_area_change_threshold:
                 # Not yet fired for this incident, and the window
                 # confirms it's genuinely been still — fire once, and
                 # anchor future re-checks to THIS position.

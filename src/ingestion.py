@@ -26,14 +26,14 @@ class VideoIngestion:
         # beginning instead of stopping. Just a setting we remember.
         self.loop_file = loop_file
 
-        # we keep source as-is for now (int stays int, string stays string)
-        self.source = source   
+        # Normalize common protocol typos so malformed RTSP URLs still open.
+        self.source = self._normalize_source(source)
 
         # this is True/False — is this an RTSP camera link or not?
         # isinstance(source, str) checks "is this a string?"
         # .startswith("rtsp://") checks if the string begins with rtsp://
         # both must be true for is_rtsp to be True
-        self.is_rtsp = isinstance(source, str) and source.startswith("rtsp://")  
+        self.is_rtsp = isinstance(self.source, str) and self.source.startswith("rtsp://")  
 
         # True only for local video files — NOT webcam (int) and NOT rtsp.
         # We need this to know whether "loop_file" should even apply.
@@ -42,6 +42,15 @@ class VideoIngestion:
         # self.cap will hold the actual OpenCV camera/video object once opened.
         # None means "not opened yet"
         self.cap = None
+
+    @staticmethod
+    def _normalize_source(source):
+        if isinstance(source, str):
+            normalized = source.strip()
+            if normalized.startswith("rstp://"):
+                normalized = "rtsp://" + normalized[len("rstp://"):]
+            return normalized
+        return source
 
         # self.frame is our "whiteboard" — the latest frame, shared between
         # the background thread and the main program. Starts empty.
@@ -89,7 +98,7 @@ class VideoIngestion:
         # Safety check: Did the camera or file actually open successfully?
         # If not, crash loudly and tell us why, rather than failing silently later.
         if not cap.isOpened():
-            raise RuntimeError(f"Could not open source: {self.raw_source}")
+            raise RuntimeError(f"Could not open source: {self.source}")
         # For local files, read the file's FPS and compute the per-frame interval
         if self.is_file:
             fps = cap.get(cv2.CAP_PROP_FPS)
