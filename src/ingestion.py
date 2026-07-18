@@ -43,15 +43,6 @@ class VideoIngestion:
         # None means "not opened yet"
         self.cap = None
 
-    @staticmethod
-    def _normalize_source(source):
-        if isinstance(source, str):
-            normalized = source.strip()
-            if normalized.startswith("rstp://"):
-                normalized = "rtsp://" + normalized[len("rstp://"):]
-            return normalized
-        return source
-
         # self.frame is our "whiteboard" — the latest frame, shared between
         # the background thread and the main program. Starts empty.
         self.frame = None           # the shared "latest frame" buffer
@@ -69,6 +60,15 @@ class VideoIngestion:
         self.source_frame_interval = None
         # Wall-clock time of the last successful read (used only for local files)
         self._last_read_time = None
+
+    @staticmethod
+    def _normalize_source(source):
+        if isinstance(source, str):
+            normalized = source.strip()
+            if normalized.startswith("rstp://"):
+                normalized = "rtsp://" + normalized[len("rstp://"):]
+            return normalized
+        return source
 
     
     def _open_capture(self):

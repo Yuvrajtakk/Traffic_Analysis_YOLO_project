@@ -69,6 +69,10 @@ class CongestionDetector:
         # Start at -inf so the very first qualifying frame is allowed.
         self.last_triggered = float("-inf")
 
+        # Tracks whether we're currently inside a congestion episode.
+        # Starts False because no over-capacity frame has been seen yet.
+        self.is_congested = False
+
     def _get_centroid(self, bbox):
         """bbox is (x1, y1, x2, y2). Return (cx, cy) — the box's center."""
         x1, y1, x2, y2 = bbox
@@ -113,14 +117,24 @@ class CongestionDetector:
                 count += 1
 
         events = []
+        currently_over = count > congestion_capacity
 
-        if count > congestion_capacity and (timestamp - self.last_triggered >= EVENT_COOLDOWN_SEC):
-            event = {
-                "count": count,
-                "capacity": congestion_capacity,
-                "timestamp": timestamp,
-            }
-            events.append(event)
-            self.last_triggered = timestamp
+        # Rising edge only: fire when the ROI transitions from normal to
+        # congested. While the episode remains active, suppress repeats.
+        if currently_over and not self.is_congested:
+            if timestamp - self.last_triggered >= EVENT_COOLDOWN_SEC:
+                event = {
+                    "count": count,
+                    "capacity": congestion_capacity,
+                    "timestamp": timestamp,
+                }
+                events.append(event)
+                self.last_triggered = timestamp
+            self.is_congested = True
+
+        # Falling edge: once count returns to capacity or below, reset so
+        # the next rise can trigger a fresh event.
+        elif not currently_over and self.is_congested:
+            self.is_congested = False
 
         return events

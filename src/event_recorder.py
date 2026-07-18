@@ -19,6 +19,7 @@ import os
 import time
 import threading
 from collections import deque
+from datetime import datetime
 
 import cv2
 
@@ -89,38 +90,30 @@ class EventRecorder:
             self.pending_collections.remove(entry)
 
     def trigger_event(self, frame, timestamp, event_type, metadata=None):
-        """
-        Call this the moment any analytics module fires an event.
-        Immediately saves an annotated .jpg, and starts a NEW pending
-        collection to gather the next POST_EVENT_SEC of frames.
-        """
         if metadata is None:
             metadata = {}
 
-        # Step A: save the annotated frame as a still image right now.
-        # Fast (milliseconds) — no threading needed for a single image.
-        # Use the full fractional timestamp so two events that happen
-        # within the same second are still captured as distinct files.
-        safe_timestamp = str(timestamp).replace(".", "_")
+        module = event_type  # now the module name: stationary/wrong_way/hazard/congestion
+        class_name = metadata.get("class_name", "unknown")
         track_id_str = metadata.get("id", "NA")
-        filename = f"{event_type}_id{track_id_str}_{safe_timestamp}.jpg"
+        readable_time = datetime.fromtimestamp(timestamp).strftime("%H%M%S_%f")[:-3]
+
+        event_id = f"{module}_{class_name}_id{track_id_str}_{readable_time}"
+        filename = f"{event_id}.jpg"
         cv2.imwrite(os.path.join(self.output_dir, filename), frame)
 
-        # Step B: snapshot the CURRENT rolling buffer as this event's
-        # "before" half. list(self.buffer) creates a genuinely SEPARATE
-        # list with its own copies — critical, because self.buffer
-        # keeps changing (growing, trimming) every subsequent frame.
-        # Without list(), before_frames would just be another name for
-        # the SAME live deque, and would silently shrink/change later
-        # as add_frame() keeps trimming it — corrupting this snapshot.
+        extra = {k: v for k, v in metadata.items() if k not in ("class_name", "id")}
+        print(
+            f"[EVENT TRIGGERED] id={event_id} | module={module} | class={class_name} "
+            f"| track_id={track_id_str} | time={datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')} "
+            f"| meta={extra}"
+        )
+
         before_frames = list(self.buffer)
 
-        # Register this as a new in-progress collection. after_frames
-        # starts empty — add_frame()'s loop above will fill it in over
-        # the next POST_EVENT_SEC, frame by frame, automatically.
         new_entry = {
-            "event_id": f"{event_type}_{int(timestamp * 1000)}",
-            "event_type": event_type,
+            "event_id": event_id,
+            "event_type": module,
             "trigger_timestamp": timestamp,
             "before_frames": before_frames,
             "after_frames": [],
@@ -128,60 +121,31 @@ class EventRecorder:
         self.pending_collections.append(new_entry)
 
     def _dispatch_to_background_writer(self, entry):
-        """
-        Hands ONE finished (before+after complete) collection off to a
-        background thread to actually write to disk. Main loop never
-        waits — no .join() here, deliberately.
-        """
-        # Each call creates its OWN independent thread — if several
-        # events finish around the same time, each gets its own
-        # helper, writing its own clip, none blocking on each other.
         thread = threading.Thread(
             target=self._write_clip, args=(entry,), daemon=True
         )
-        # daemon=True: this thread dies automatically if the main
-        # program exits, same reasoning as VideoIngestion's thread —
-        # no lingering zombie background work after shutdown.
         thread.start()
 
     def _write_clip(self, entry):
-        """
-        Runs in a BACKGROUND THREAD. Combines before+after frames and
-        writes them to an .mp4 file. Slow — this is exactly why it's
-        threaded rather than running on the main loop.
-        """
-        # Glue the two piles together into one continuous sequence.
         all_frames = entry["before_frames"] + entry["after_frames"]
 
         if len(all_frames) < 2:
-            # Not enough real data to make a meaningful clip (e.g. an
-            # event fired right at startup, before the buffer had
-            # anything in it yet) — skip rather than write junk.
+            print(f"[EVENT SKIPPED] id={entry['event_id']} — not enough frames to write a clip")
             return
 
-        # Real playback speed, derived from ACTUAL elapsed time between
-        # the first and last collected frame — not an assumed constant.
-        # This is the same timestamp-based philosophy used everywhere
-        # else in this project (TrackManager, all four analytics
-        # modules) — real FPS can drift, so we measure it directly.
         duration = all_frames[-1][0] - all_frames[0][0]
         fps = len(all_frames) / duration if duration > 0 else 20
 
-        # Ask the very first frame how big it is — cv2's VideoWriter
-        # needs to know the exact frame size upfront.
         height, width = all_frames[0][1].shape[:2]
-
         path = os.path.join(self.output_dir, entry["event_id"] + ".mp4")
 
-        # mp4v is a widely-compatible codec choice — a safe default for
-        # .mp4 output without requiring extra codec installs.
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
-
-        # Write every collected frame, in order, into the video file.
         for ts, frame in all_frames:
             writer.write(frame)
-
-        # Finalizes the file so it's a valid, playable video — without
-        # this, the file could be left in a broken/incomplete state.
         writer.release()
+
+        print(
+            f"[EVENT SAVED] id={entry['event_id']} | frames={len(all_frames)} "
+            f"| duration={duration:.2f}s | fps={fps:.1f} | file={path}"
+        )

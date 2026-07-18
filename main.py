@@ -32,7 +32,7 @@ from config.live_config import LiveConfig
 from src.tuning_panel import TuningPanel
 
 
-SOURCE = "rtsp://10.158.78.2:1945/"
+SOURCE = "data/test_footage/sample.mp4"  # or whichever clip you pick
 WEIGHTS = "models/weights/new_best.pt"
 
 
@@ -57,11 +57,20 @@ def toggle_module_state(module_state, key):
     module_state[module_name] = not module_state[module_name]
 
 
-def build_status_text(module_state):
+def build_status_text(module_state, dashboard_visible=False, panel_visible=False):
     status_parts = []
     for module_name, label in MODULE_ORDER:
         status_parts.append(f"{label}:{'ON' if module_state[module_name] else 'OFF'}")
+    status_parts.append(f"D:{'ON' if dashboard_visible else 'OFF'}")
+    status_parts.append(f"T:{'ON' if panel_visible else 'OFF'}")
     return " ".join(status_parts)
+
+
+def print_tuning_snapshot(config):
+    print("\n--- Current live tuning (copy into thresholds.py if you like it) ---")
+    for key, value in config.snapshot().items():
+        print(f"{key} = {value}")
+    print("---------------------------------------------------------------\n")
 
 
 def should_quit(key, window_name):
@@ -86,6 +95,14 @@ def resize_frame_for_display(frame, max_width=1280, max_height=720):
 
 
 def main():
+    global SOURCE
+
+    source_choice = input("Input source — type 'file' or 'live': ").strip().lower()
+    if source_choice == "live":
+        SOURCE = "rtsp://127.0.0.1:8554/mystream"
+    else:
+        SOURCE = "data/test_footage/sample.mp4"
+
     # ================= PIECE 0: shared live-tunable config ==========
     # ONE LiveConfig instance, passed into the tracker, every analytics
     # detector, and the tuning panel — this is what lets one trackbar
@@ -142,11 +159,16 @@ def main():
         "hazards": True,
         "congestion": True,
     }
-    cv2.namedWindow(window_name)
+    dashboard_visible = False
+    panel_visible = False
+    tuning_panel = None
 
-    # Opens the second "Tuning Panel" window with every live-tunable
-    # trackbar wired straight into `config` — see src/tuning_panel.py.
-    tuning_panel = TuningPanel(config)
+    # OpenCV keyboard input is tied to HighGUI windows, so this tiny
+    # control window is the reliable place to catch d/t/s/w/h/c/p/q
+    # before the user chooses to open the full dashboard.
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 320, 80)
+    cv2.imshow(window_name, first_frame[:1, :1])
 
     # ================= PIECE 3-7: the real-time loop =================
     while True:
@@ -175,18 +197,26 @@ def main():
 
         if module_state["stationary"]:
             stationary_events = stationary_detector.check(timestamp=now)
+            for e in stationary_events:
+                e["module"] = "stationary"
 
         if module_state["wrong_way"]:
             wrong_way_events = wrong_way_detector.check(timestamp=now)
+            for e in wrong_way_events:
+                e["module"] = "wrong_way"
 
         if module_state["hazards"]:
             # only this one needs the raw detections list — it has no
             # TrackManager, no history, it just reads what YOLO saw
             # THIS frame, directly
             hazard_events = hazard_detector.check(detections, timestamp=now)
+            for e in hazard_events:
+                e["module"] = "hazard"
 
         if module_state["congestion"]:
             congestion_events = congestion_detector.check(timestamp=now)
+            for e in congestion_events:
+                e["module"] = "congestion"
 
         # ---- Piece 6: hand fired events to event_recorder ----
         all_events = (
@@ -199,7 +229,7 @@ def main():
             event_recorder.trigger_event(
                 frame,
                 timestamp=now,
-                event_type=event.get("class_name", "event"),
+                event_type=event.get("module", "event"),
                 metadata=event,
             )
 
@@ -211,22 +241,43 @@ def main():
         for det in detections:
             x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            track_id = det.get("id", "NA")
+            if track_id in track_manager.tracks:
+                history = track_manager.tracks[track_id]["history"]
+                if len(history) >= 5:
+                    old_x1, old_y1, old_x2, old_y2 = [int(v) for v in history[-5][1]]
+                    old_centroid = ((old_x1 + old_x2) // 2, (old_y1 + old_y2) // 2)
+                    current_centroid = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    cv2.arrowedLine(
+                        frame, old_centroid, current_centroid,
+                        (0, 255, 255), 2, tipLength=0.4,
+                    )
+
+            conf = det.get("confidence", None)
+            label = (
+                f"{det['class_name']} {conf:.2f} ID:{track_id}"
+                if conf is not None
+                else f"{det['class_name']} ID:{track_id}"
+            )
+
             cv2.putText(
-                frame, det["class_name"], (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                frame, label, (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
             )
 
         cv2.putText(
             frame,
-            build_status_text(module_state),
+            build_status_text(module_state, dashboard_visible, panel_visible),
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (0, 255, 0),
             2,
         )
-        display_frame = resize_frame_for_display(frame)
-        cv2.imshow(window_name, display_frame)
+        if dashboard_visible:
+            display_frame = resize_frame_for_display(frame)
+            cv2.imshow(window_name, display_frame)
 
         # waitKey(1) pauses 1ms AND tells us which key was pressed —
         # also what actually makes the window repaint on screen
@@ -239,7 +290,24 @@ def main():
             # Print the current live tuning to the console — a
             # paste-ready snapshot for thresholds.py once a tuning
             # session finds values worth keeping permanently.
-            tuning_panel.print_snapshot()
+            print_tuning_snapshot(config)
+        if key == ord("d"):
+            dashboard_visible = not dashboard_visible
+            if dashboard_visible:
+                cv2.resizeWindow(window_name, 1280, 720)
+            else:
+                cv2.resizeWindow(window_name, 320, 80)
+                cv2.imshow(window_name, frame[:1, :1])
+        if key == ord("t"):
+            panel_visible = not panel_visible
+            if panel_visible:
+                # Trackbars live in the Tuning Panel window and write
+                # straight into `config`; creating them only on demand
+                # keeps startup clean for demo recordings.
+                tuning_panel = TuningPanel(config)
+            elif tuning_panel is not None:
+                cv2.destroyWindow(TuningPanel.WINDOW_NAME)
+                tuning_panel = None
 
     # ================= cleanup — runs ONCE, after break =================
     cap.stop()

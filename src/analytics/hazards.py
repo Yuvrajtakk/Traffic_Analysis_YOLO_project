@@ -8,25 +8,28 @@ TrackManager or per-object position history — hazards don't have a
 meaningful stable "identity" to track across frames the way a vehicle
 does. Instead, this module works directly off each frame's RAW
 detections (straight from YOLOTracker.track()), checking: has a given
-hazard CLASS been seen, confidently, in EVERY frame continuously for at
-least HAZARD_PERSISTENCE_SEC?
+hazard CLASS been seen confidently in enough of the last few frames,
+for at least HAZARD_PERSISTENCE_SEC?
 
 LIVE TUNING: HAZARD_CONFIDENCE_THRESHOLD and HAZARD_PERSISTENCE_SEC are
 read from the shared LiveConfig object (self.config) fresh every
 check() call — see config/live_config.py.
 
-KNOWN LIMITATION: persistence requires a detection in literally every
-processed frame with no gaps — a single missed/low-confidence frame due
-to detector flicker resets the streak entirely, even if the underlying
-real-world hazard never actually stopped. A more forgiving version
-(e.g. "confident in 8 of the last 10 frames") would tolerate flicker
-better but is deliberately deferred, matching this project's pattern of
-building the simple strict version first.
+The flicker rule is intentionally simple and explainable: for each
+hazard class, remember only the last M frames as True/False values.
+If at least N of those M frames were confident detections, count the
+hazard as present. This prevents smoke/fire/smoke flicker from causing
+repeated start/stop behavior.
 """
 
 import time
 
-from config.thresholds import HAZARD_CLASSES, HAZARD_EVENT_COOLDOWN_SEC
+from config.thresholds import (
+    HAZARD_CLASSES,
+    HAZARD_EVENT_COOLDOWN_SEC,
+    HAZARD_FLICKER_MIN_CONFIDENT_FRAMES,
+    HAZARD_FLICKER_WINDOW_FRAMES,
+)
 
 
 class HazardDetector:
@@ -48,6 +51,30 @@ class HazardDetector:
 
         # Same cooldown pattern as before, still keyed by class name.
         self.last_triggered = {}
+
+        # Keyed by class name. Each value is a short list of booleans:
+        # True means this class was confidently seen in that frame,
+        # False means it was missed or below confidence.
+        self.recent_presence = {cls: [] for cls in HAZARD_CLASSES}
+
+    def _remember_presence(self, cls, was_seen):
+        """
+        Store this frame's True/False result for one hazard class,
+        keeping only the most recent HAZARD_FLICKER_WINDOW_FRAMES.
+        """
+        recent = self.recent_presence.setdefault(cls, [])
+        recent.append(was_seen)
+
+        if len(recent) > HAZARD_FLICKER_WINDOW_FRAMES:
+            recent.pop(0)
+
+    def _is_present_despite_flicker(self, cls):
+        """
+        Return True when this class was confidently detected in enough
+        of the recent frames. Example with defaults: 3 of last 5.
+        """
+        recent = self.recent_presence.get(cls, [])
+        return recent.count(True) >= HAZARD_FLICKER_MIN_CONFIDENT_FRAMES
 
     def check(self, detections, timestamp=None):
         """
@@ -92,14 +119,17 @@ class HazardDetector:
             # about class-level presence, not counting instances.
             seen_this_frame[det["class_name"]] = det
 
-        # STEP B — for every possible hazard class, decide: seen this
-        # frame or not, and update the persistence streak accordingly.
+        # STEP B — for every possible hazard class, remember whether it
+        # was seen this frame, then decide whether recent history is
+        # strong enough to count it as currently present.
         # Structurally identical to wrong_way.py's if/else block, just
         # keyed by class name instead of track_id.
         for cls in HAZARD_CLASSES:
+            self._remember_presence(cls, cls in seen_this_frame)
+            present_now = self._is_present_despite_flicker(cls)
 
-            if cls in seen_this_frame:
-                # Seen, confidently, this frame.
+            if present_now:
+                # Seen confidently in enough recent frames.
 
                 # First frame we've seen this class? Start its clock.
                 if cls not in self.hazard_since:
@@ -116,6 +146,11 @@ class HazardDetector:
                     # while the hazard remains visible.
                     last_time = self.last_triggered.get(cls, float("-inf"))
                     if timestamp - last_time >= HAZARD_EVENT_COOLDOWN_SEC:
+                        # If this frame is one of the tolerated missed
+                        # frames, wait for a fresh bbox before recording.
+                        if cls not in seen_this_frame:
+                            continue
+
                         det = seen_this_frame[cls]
                         event = {
                             "class_name": cls,
@@ -127,11 +162,9 @@ class HazardDetector:
                         self.last_triggered[cls] = timestamp
 
             else:
-                # NOT seen this frame — streak broken. Remove this
-                # class's entry entirely so a FUTURE sighting starts
-                # counting from zero, not from a stale old timestamp.
-                # This is what makes "continuous" actually mean
-                # continuous, with zero tolerance for gaps.
+                # Not present in enough of the recent frames — streak
+                # broken. One missed frame no longer breaks it; several
+                # misses in the rolling window do.
                 self.hazard_since.pop(cls, None)
 
         return events

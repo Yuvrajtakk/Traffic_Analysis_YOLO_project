@@ -3,9 +3,9 @@ src/analytics/wrong_way.py
 
 Module II — Wrong-Way Trajectory Detection (multi-lane / multi-zone).
 
-A vehicle is flagged if its trajectory vector points against the
-EXPECTED flow vector *for whichever zone its centroid currently sits
-in* (cosine < threshold), for a continuous window of
+A vehicle is flagged if its trajectory vector clearly points against
+the EXPECTED flow vector *for whichever zone its centroid currently
+sits in* (cosine < negative threshold), for a continuous window of
 WRONG_WAY_DURATION_SEC. Uses the SAME shared TrackManager history that
 stationary.py reads from.
 
@@ -210,6 +210,9 @@ class WrongWayDetector:
             # Compare T against THIS zone's expected direction.
             cosine = self._cosine_similarity(T, expected_flow)
 
+            # Positive cosine means generally aligned with the expected
+            # flow. Only a negative-enough cosine means the vehicle is
+            # clearly moving opposite the zone's flow.
             if cosine < wrong_way_cosine_threshold:
                 # Wrong-way THIS frame. If this is the first frame we've
                 # seen it go wrong-way, start the clock right now.

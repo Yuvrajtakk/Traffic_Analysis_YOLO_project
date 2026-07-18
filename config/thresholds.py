@@ -67,31 +67,26 @@ STATIONARY_AREA_CHANGE_THRESHOLD = 0.25
 # live-tunable — see live_config.py. These are just startup defaults.
 WRONG_WAY_DURATION_SEC = 5
 WRONG_WAY_SMOOTHING_WINDOW = 10
-WRONG_WAY_COSINE_THRESHOLD = 0.5
+# Cosine values mean:
+#   +1 = same direction as the expected flow
+#    0 = sideways / unclear
+#   -1 = opposite direction
+# Wrong-way should only trigger when movement is clearly opposite, so
+# the default is negative. A positive value like 0.487 is still mostly
+# aligned and must NOT be treated as wrong-way.
+WRONG_WAY_COSINE_THRESHOLD = -0.3
 
 # Each zone: a polygon in NORMALIZED (0-1) image coordinates — same
 # convention as CONGESTION_ROI_POLYGON_NORM below — plus the (x, y)
 # direction traffic is EXPECTED to flow for any vehicle whose centroid
 # falls inside that polygon.
 #
-# PLACEHOLDER GEOMETRY — same status as CONGESTION_ROI_POLYGON_NORM:
-# this is a rough vertical half-split (left half / right half of
-# frame), not a manually traced lane boundary. Real deployment needs
-# a human looking at an actual sample frame from the real camera and
-# tracing the real lane edges as polygon points before these zones are
-# meaningfully accurate. Two zones shown here as a working multi-lane
-# EXAMPLE — add/remove/reshape zones to match the real intersection.
-WRONG_WAY_ZONES = [
-    {
-        "polygon": [(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)],
-        "flow_vector": (1.0, 0.0),    # left half of frame: traffic expected moving RIGHT
-    },
-    {
-        "polygon": [(0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0)],
-        "flow_vector": (-1.0, 0.0),   # right half of frame: traffic expected moving LEFT
-    },
-]
-
+# Traced against real test footage. The per-zone flow-vector direction
+# is still an approximation for this specific test video's camera angle
+# near the vanishing point: accurate enough for the stated task, not
+# perfectly tuned, needs re-verification against the real deployed
+# camera.
+WRONG_WAY_ZONES = [{'polygon': [(0.482, 0.3181), (0.0039, 0.6222), (0.0023, 0.9917), (0.4375, 0.9972), (0.4875, 0.4083), (0.5047, 0.3458), (0.5047, 0.3194)], 'flow_vector': (0.0, -1.0)}, {'polygon': [(0.5219, 0.3278), (0.5133, 0.3583), (0.5227, 0.5458), (0.5953, 0.9958), (0.9984, 0.9944), (0.9938, 0.6875), (0.8187, 0.4625), (0.5625, 0.3333)], 'flow_vector': (0.0, 1.0)}]
 # Used ONLY if a vehicle's centroid falls outside EVERY zone above
 # (e.g. zones don't cover the full frame, or a vehicle briefly strays
 # off-road). Deliberately falls back to a sane default rather than
@@ -102,19 +97,17 @@ WRONG_WAY_DEFAULT_FLOW_VECTOR = (1.0, 0.0)
 # Both live-tunable — see live_config.py. Startup defaults only.
 HAZARD_CONFIDENCE_THRESHOLD = 0.25  
 HAZARD_PERSISTENCE_SEC = 1        
+HAZARD_FLICKER_WINDOW_FRAMES = 5
+HAZARD_FLICKER_MIN_CONFIDENT_FRAMES = 3
 
 # ── Module IV: Congestion / Density ─────────────────────────────────
 # Live-tunable — see live_config.py. Startup default only.
 CONGESTION_CAPACITY = 5  
-# Default ROI polygon in NORMALIZED (0-1) image coordinates — a rough
-# placeholder covering most of the frame. Real deployment requires
-# manually tracing the actual road boundary for each specific camera
-# (see congestion.py's KNOWN LIMITATION note).
+# ROI polygon in NORMALIZED (0-1) image coordinates, traced against
+# the current real test footage.
 CONGESTION_ROI_POLYGON_NORM = [
-    (0.05, 0.35),
-    (0.95, 0.35),
-    (0.95, 0.95),
-    (0.05, 0.95),
+    (0.4875, 0.3292), (0.0031, 0.675), (0.0031, 0.975), (0.9977, 0.9722),
+    (0.9969, 0.6903), (0.6281, 0.4028), (0.5547, 0.3361), (0.4891, 0.3292),
 ] 
 
 # ── Event Recording ──────────────────────────────────────────────────
@@ -122,11 +115,12 @@ PRE_EVENT_SEC = 2
 POST_EVENT_SEC = 2   
 EVENT_COOLDOWN_SEC = 2  
 HAZARD_EVENT_COOLDOWN_SEC = 30
-# Hazard events (Fire/Smoke/Accident) use a longer cooldown than other
-# modules. A misclassification can persist for minutes on a single
-# object, and firing every 2 seconds during that time floods the
-# events folder. 30s still catches a genuine hazard quickly while
-# limiting repeat noise from a stuck false positive.
+# Hazard events use a longer cooldown than other modules. A
+# misclassification can persist for minutes on a single object, and
+# firing every 2 seconds during that time floods the events folder.
+# 30s still catches a genuine hazard quickly while limiting repeat
+# noise from a stuck false positive. This same cooldown is fine for
+# Obj_On_Road and Animal because they use the same event path.
 
 # ── Vehicle class taxonomy (used across multiple modules) ──────────
 # NOT live-tunable — taxonomy, not a numeric threshold.
@@ -140,9 +134,16 @@ HAZARD_EVENT_COOLDOWN_SEC = 30
 VEHICLE_CLASSES = ['Car', 'Bike', 'Bus', 'Truck']
 HAZARD_CLASSES = ['Fire', 'Smoke', 'Accident']
 
-# Not currently consumed by any module yet — 'Obj_On_Road' (debris/
-# object blocking the road) and 'Animal' are real trained classes with
-# no analytics logic built around them. Worth a deliberate decision in
-# a future phase: fold Obj_On_Road into HAZARD_CLASSES, or give it its
-# own module? Flagging here rather than silently ignoring it.
-UNUSED_TRAINED_CLASSES = ['Obj_On_Road', 'Animal']
+# Detected and drawn on-screen like any other class, but intentionally
+# NOT wired into hazards.py's event/recording pipeline — Ankit sir's
+# brief only specifies analytics tasks for Fire/Smoke/Accident
+# (stationary/wrong-way/congestion cover the vehicle classes).
+# Animal is a standard detection class (grouped with Bus/Car/Bike/
+# Person in the brief); Object_on_road has no task mapped to it either.
+DETECTION_ONLY_CLASSES = ['Animal', 'Obj_On_Road']
+
+# All trained classes now have an explicit route:
+# vehicles go through vehicle analytics, and Fire/Smoke/Accident/
+# Obj_On_Road/Animal go through hazards.py's flicker + persistence +
+# cooldown logic.
+UNUSED_TRAINED_CLASSES = []
