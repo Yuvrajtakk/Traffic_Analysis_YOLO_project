@@ -106,10 +106,29 @@ class TuningPanel:
         )
 
         # ── Congestion capacity: trackbar 1-50 vehicles, 1:1 ───────
+        # NOTE: with the stopped-vehicle congestion logic, this is the
+        # number of SIMULTANEOUSLY STOPPED vehicles the ROI tolerates
+        # before congestion fires — not a raw visible-vehicle count.
         cv2.createTrackbar(
             "Congestion Cap", self.WINDOW_NAME,
             int(config.CONGESTION_CAPACITY), 50,
             self._make_callback("CONGESTION_CAPACITY", lambda v: max(1, v)),
+        )
+
+        # ── Congestion stopped-duration: trackbar 1-30 seconds, 1:1 ─
+        # How long a single vehicle must stay put before it counts as
+        # "stopped" toward the congestion tally.
+        cv2.createTrackbar(
+            "Congestion Stop Sec", self.WINDOW_NAME,
+            int(config.CONGESTION_STOPPED_DURATION_SEC), 30,
+            self._make_callback("CONGESTION_STOPPED_DURATION_SEC", lambda v: max(1, v)),
+        )
+
+        # ── Congestion stopped-pixel tolerance: trackbar 1-50px, 1:1 ─
+        cv2.createTrackbar(
+            "Congestion Stop Px", self.WINDOW_NAME,
+            int(config.CONGESTION_STOPPED_PIXEL_THRESHOLD), 50,
+            self._make_callback("CONGESTION_STOPPED_PIXEL_THRESHOLD", lambda v: max(1, v)),
         )
 
     def _make_callback(self, attr_name, transform):

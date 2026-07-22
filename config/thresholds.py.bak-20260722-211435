@@ -86,7 +86,7 @@ WRONG_WAY_COSINE_THRESHOLD = -0.3
 # near the vanishing point: accurate enough for the stated task, not
 # perfectly tuned, needs re-verification against the real deployed
 # camera.
-WRONG_WAY_ZONES = [{'polygon': [(0.4813, 0.3222), (0.0078, 0.6236), (0.0031, 0.9819), (0.4352, 0.9931), (0.4875, 0.4111), (0.5039, 0.3431)], 'flow_vector': (0.0, -1.0)}, {'polygon': [(0.5227, 0.325), (0.5086, 0.3625), (0.5938, 0.9917), (0.9961, 0.9917), (0.9945, 0.6333), (0.5648, 0.3472), (0.5586, 0.3208)], 'flow_vector': (0.0, 1.0)}]
+WRONG_WAY_ZONES = [{'polygon': [(0.482, 0.3278), (0.3703, 0.3917), (0.0016, 0.6875), (0.0047, 0.9861), (0.4305, 0.9972), (0.4961, 0.3569), (0.5055, 0.3375), (0.4867, 0.3278)], 'flow_vector': (0.0, -1.0)}, {'polygon': [(0.5305, 0.3292), (0.5117, 0.3514), (0.5086, 0.4569), (0.6039, 0.9986), (0.9938, 0.9958), (0.9977, 0.6278), (0.557, 0.3278)], 'flow_vector': (0.0, 1.0)}]
 # Used ONLY if a vehicle's centroid falls outside EVERY zone above
 # (e.g. zones don't cover the full frame, or a vehicle briefly strays
 # off-road). Deliberately falls back to a sane default rather than

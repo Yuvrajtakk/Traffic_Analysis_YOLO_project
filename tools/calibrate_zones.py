@@ -54,6 +54,17 @@ def draw_polygons():
         draw_one_polygon(display, polygon, close_shape=True)
 
     draw_one_polygon(display, current_polygon, close_shape=False)
+    
+    # Add guidance text
+    cv2.putText(display, "Left-Click: Add Point", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+    cv2.putText(display, "Left-Click: Add Point", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(display, "Press 'n': Finish current polygon", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+    cv2.putText(display, "Press 'n': Finish current polygon", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(display, "Press 's': Save all and continue", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+    cv2.putText(display, "Press 's': Save all and continue", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(display, "Press 'q': Quit without saving", (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+    cv2.putText(display, "Press 'q': Quit without saving", (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
     cv2.imshow(WINDOW_NAME, display)
 
 
@@ -94,19 +105,59 @@ def finish_current_polygon():
 
 def parse_flow_vector(text):
     """
-    Accept simple console input like '1,0' or '-1, 0'. If parsing fails,
-    fall back to (1.0, 0.0) so the printed dict is still paste-ready.
+    Accept simple text options like 'up', 'down', 'left', 'right' or
+    coordinate fallback like '1,0'.
     """
+    text = text.strip().lower()
+    
+    if text in ["left", "l"]:
+        return (-1.0, 0.0)
+    if text in ["right", "r"]:
+        return (1.0, 0.0)
+    if text in ["up", "u", "away"]:
+        return (0.0, -1.0)
+    if text in ["down", "d", "towards"]:
+        return (0.0, 1.0)
+        
     try:
         parts = text.replace(",", " ").split()
         return (float(parts[0]), float(parts[1]))
     except (IndexError, ValueError):
-        print("Could not read that flow vector; using (1.0, 0.0).")
+        print("Could not read that flow vector; using (1.0, 0.0) (Right).")
         return (1.0, 0.0)
 
 
-def print_results():
-    """Print both formats already used in config/thresholds.py."""
+def run_calibration_ui(input_frame):
+    """
+    Run the click-tracing loop on the provided frame.
+    Returns: (congestion_roi_polygon, wrong_way_zones_list) or (None, None) if cancelled.
+    """
+    global frame, current_polygon, finished_polygons
+    frame = input_frame.copy()
+    current_polygon.clear()
+    finished_polygons.clear()
+
+    cv2.namedWindow(WINDOW_NAME)
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    draw_polygons()
+
+    saved = False
+    while True:
+        key = cv2.waitKey(20) & 0xFF
+
+        if key == ord("n"):
+            finish_current_polygon()
+        elif key == ord("s"):
+            saved = True
+            break
+        elif key == ord("q"):
+            break
+
+    cv2.destroyAllWindows()
+
+    if not saved:
+        return None, None
+
     height, width = frame.shape[:2]
 
     if len(current_polygon) >= 3:
@@ -114,20 +165,35 @@ def print_results():
         current_polygon.clear()
 
     if not finished_polygons:
-        print("No finished polygons to print.")
-        return
+        return None, None
 
-    print("\nCONGESTION_ROI_POLYGON_NORM example:")
-    print(normalize_polygon(finished_polygons[0], width, height))
+    congestion_roi = normalize_polygon(finished_polygons[0], width, height)
 
-    print("\nWRONG_WAY_ZONES example:")
     zones = []
     for i, polygon in enumerate(finished_polygons, start=1):
-        text = input(f"Flow vector for polygon {i} (example 1,0): ")
+        print(f"\n--- Polygon {i} Flow Direction ---")
+        print("Which way should traffic flow here?")
+        print("Options: 'up' (away from camera), 'down' (towards camera), 'left', 'right'")
+        print("Or enter custom x,y coordinates (e.g. '1,0')")
+        text = input(f"Flow direction for polygon {i}: ")
         zones.append({
             "polygon": normalize_polygon(polygon, width, height),
             "flow_vector": parse_flow_vector(text),
         })
+
+    return congestion_roi, zones
+
+
+def print_results(congestion_roi, zones):
+    """Print both formats already used in config/thresholds.py."""
+    if congestion_roi is None:
+        print("No finished polygons to print.")
+        return
+
+    print("\nCONGESTION_ROI_POLYGON_NORM example:")
+    print(congestion_roi)
+
+    print("\nWRONG_WAY_ZONES example:")
     print(zones)
 
 
@@ -144,25 +210,9 @@ def main():
         print("Could not read one frame from:", sys.argv[1])
         return
 
-    global frame
-    frame = loaded_frame
-
-    cv2.namedWindow(WINDOW_NAME)
-    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
-    draw_polygons()
-
-    while True:
-        key = cv2.waitKey(20) & 0xFF
-
-        if key == ord("n"):
-            finish_current_polygon()
-        elif key == ord("s"):
-            print_results()
-            break
-        elif key == ord("q"):
-            break
-
-    cv2.destroyAllWindows()
+    congestion_roi, zones = run_calibration_ui(loaded_frame)
+    if congestion_roi is not None:
+        print_results(congestion_roi, zones)
 
 
 if __name__ == "__main__":

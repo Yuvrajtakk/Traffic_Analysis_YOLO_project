@@ -18,7 +18,14 @@ console in a paste-ready format for thresholds.py.
 """
 
 import time
+import sys
+import shutil
+import threading
+import msvcrt
+import re
+import datetime
 
+import torch
 import cv2
 
 from src.ingestion import VideoIngestion
@@ -30,6 +37,20 @@ from src.analytics.congestion import CongestionDetector
 from src.event_recorder import EventRecorder
 from config.live_config import LiveConfig
 from src.tuning_panel import TuningPanel
+from tools.calibrate_zones import run_calibration_ui, print_results
+
+
+def probe_rtsp(url, timeout=2.0):
+    import socket
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or 554
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 
 SOURCE = "data/test_footage/sample.mp4"  # or whichever clip you pick
@@ -73,9 +94,12 @@ def print_tuning_snapshot(config):
     print("---------------------------------------------------------------\n")
 
 
-def should_quit(key, window_name):
+def should_quit(key, window_name, dashboard_visible):
     if key == ord("q"):
         return True
+
+    if not dashboard_visible:
+        return False
 
     try:
         return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
@@ -97,11 +121,14 @@ def resize_frame_for_display(frame, max_width=1280, max_height=720):
 def main():
     global SOURCE
 
-    source_choice = input("Input source — type 'file' or 'live': ").strip().lower()
-    if source_choice == "live":
-        SOURCE = "rtsp://127.0.0.1:8554/mystream"
+    rtsp_url = "rtsp://127.0.0.1:8554/mystream"
+    file_fallback = "data/test_footage/sample.mp4"
+    if probe_rtsp(rtsp_url, timeout=2.0):
+        SOURCE = rtsp_url
+        print(f"Live source detected at {SOURCE} — using live feed.")
     else:
-        SOURCE = "data/test_footage/sample.mp4"
+        SOURCE = file_fallback
+        print(f"No live RTSP source reachable — using test file: {SOURCE}")
 
     # ================= PIECE 0: shared live-tunable config ==========
     # ONE LiveConfig instance, passed into the tracker, every analytics
@@ -119,7 +146,9 @@ def main():
     # memory the instant __init__ finishes. Nothing left to "start."
     # imgsz now defaults to MODEL_IMGSZ (960) from thresholds.py,
     # matching the resolution new_best.pt was actually trained at.
-    tracker = YOLOTracker(weights_path=WEIGHTS, config=config)
+    device = "0" if torch.cuda.is_available() else "cpu"
+    print(f"Running inference on: {'GPU' if device == '0' else 'CPU'}")
+    tracker = YOLOTracker(weights_path=WEIGHTS, config=config, device=device)
 
     # ONE shared TrackManager — every analytics module below reads
     # from this SAME object, so none of them can ever disagree about
@@ -129,17 +158,49 @@ def main():
     # PRIME THE FRAME: CongestionDetector and WrongWayDetector both
     # need real frame_width and frame_height to build their ROI/zone
     # polygons, and those numbers don't exist until we've actually
-    # read one real frame. Keep asking cap.read() until it stops
-    # returning None. This also guarantees every frame we touch from
-    # here on is real, valid image data — never garbage, never corrupted.
+    # read one real frame. cap.read() now returns a (frame, timestamp)
+    # pair — for files the timestamp is the frame's PTS in VIDEO time,
+    # for live sources it's wall-clock time.
     first_frame = None
+    first_timestamp = None
     while first_frame is None:
-        first_frame = cap.read()
+        first_frame, first_timestamp = cap.read()
         if first_frame is None:
+            if cap.is_finished():
+                raise RuntimeError(f"Source ended before delivering a single frame: {SOURCE}")
             time.sleep(0.05)  # don't spin the CPU at 100% while waiting
 
     # .shape gives (height, width, channels) — note the ORDER.
     frame_height, frame_width = first_frame.shape[:2]
+
+    calibrated = input("Have you already calibrated the zone/ROI polygons for this source? [y/n]: ").strip().lower()
+    if calibrated == 'n':
+        congestion_roi, zones = run_calibration_ui(first_frame)
+        if congestion_roi is not None:
+            apply_to_file = input("Apply these calibrated values directly into config/thresholds.py now? [y/n]: ").strip().lower()
+            if apply_to_file == 'y':
+                timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                backup_path = f"config/thresholds.py.bak-{timestamp}"
+                shutil.copy("config/thresholds.py", backup_path)
+                
+                with open("config/thresholds.py", "r") as f:
+                    content = f.read()
+                
+                content = re.sub(r'CONGESTION_ROI_POLYGON_NORM\s*=\s*\[.*?\](?=\n\s*#\s*How much the vehicle)', f"CONGESTION_ROI_POLYGON_NORM = {congestion_roi}", content, flags=re.DOTALL)
+                content = re.sub(r'WRONG_WAY_ZONES\s*=\s*\[.*?\](?=\n\s*#\s*Used ONLY if a vehicle)', f"WRONG_WAY_ZONES = {zones}", content, flags=re.DOTALL)
+                
+                with open("config/thresholds.py", "w") as f:
+                    f.write(content)
+                print(f"Updated config/thresholds.py directly. Backup saved to {backup_path}")
+            else:
+                print_results(congestion_roi, zones)
+                print("Note: These values are one-time-use only. You will need to redo calibration or paste these manually on future runs.")
+
+    start_monitor = input("Start monitoring now? [y/n]: ").strip().lower()
+    if start_monitor == 'n':
+        print("Exiting as requested.")
+        cap.stop()
+        sys.exit(0)
 
     # Build the four analytics detectors — only NOW, after
     # frame_width/frame_height actually exist. All four now also take
@@ -163,25 +224,37 @@ def main():
     panel_visible = False
     tuning_panel = None
 
-    # OpenCV keyboard input is tied to HighGUI windows, so this tiny
-    # control window is the reliable place to catch d/t/s/w/h/c/p/q
-    # before the user chooses to open the full dashboard.
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 320, 80)
-    cv2.imshow(window_name, first_frame[:1, :1])
+    print("Press 'd' to open the dashboard.")
 
     # ================= PIECE 3-7: the real-time loop =================
+    pending_frame = first_frame
+    pending_timestamp = first_timestamp
+    fps_counter_frames = 0
+    fps_counter_started = time.perf_counter()
+    dashboard_fps = 0.0
+
     while True:
-        frame = cap.read()
+        if pending_frame is not None:
+            frame = pending_frame
+            now = pending_timestamp
+            pending_frame = None
+            pending_timestamp = None
+        else:
+            frame, now = cap.read()
+
         if frame is None:
             # background thread hasn't got a frame ready yet — skip
             # this spin entirely, try again next time round
+            if cap.is_finished():
+                break
+            time.sleep(0.002)
             continue
 
         # ---- Piece 4: run YOLO + update shared tracking state ----
-        # grabbed ONCE so every module this frame agrees on "what time
-        # it is" — avoids tiny timestamp mismatches between modules
-        now = time.time()
+        # timestamp is grabbed from VideoIngestion so local files use
+        # exact video PTS while live feeds use wall-clock time.
+        if now is None:
+            now = time.time()
         detections = tracker.track(frame)
         track_manager.update(detections, timestamp=now)
 
@@ -238,6 +311,13 @@ def main():
         event_recorder.add_frame(frame, timestamp=now)
 
         # ---- Piece 7: draw + display ----
+        fps_counter_frames += 1
+        fps_elapsed = time.perf_counter() - fps_counter_started
+        if fps_elapsed >= 1.0:
+            dashboard_fps = fps_counter_frames / fps_elapsed
+            fps_counter_frames = 0
+            fps_counter_started = time.perf_counter()
+
         for det in detections:
             x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -275,14 +355,33 @@ def main():
             (0, 255, 0),
             2,
         )
+        cv2.putText(
+            frame,
+            f"FPS:{dashboard_fps:.1f}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
+
         if dashboard_visible:
             display_frame = resize_frame_for_display(frame)
             cv2.imshow(window_name, display_frame)
+            key = cv2.waitKey(1) & 0xFF
+        else:
+            key = 255
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                if ch in (b'\x00', b'\xe0'):
+                    msvcrt.getch()
+                else:
+                    try:
+                        key = ord(ch.decode("utf-8").lower())
+                    except UnicodeDecodeError:
+                        pass
 
-        # waitKey(1) pauses 1ms AND tells us which key was pressed —
-        # also what actually makes the window repaint on screen
-        key = cv2.waitKey(1) & 0xFF
-        if should_quit(key, window_name):
+        if should_quit(key, window_name, dashboard_visible):
             break
         if key in KEY_TOGGLE_MAP:
             toggle_module_state(module_state, key)
@@ -294,11 +393,15 @@ def main():
         if key == ord("d"):
             dashboard_visible = not dashboard_visible
             if dashboard_visible:
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(window_name, 1280, 720)
             else:
-                cv2.resizeWindow(window_name, 320, 80)
-                cv2.imshow(window_name, frame[:1, :1])
-        if key == ord("t"):
+                cv2.destroyWindow(window_name)
+                if panel_visible:
+                    cv2.destroyWindow(TuningPanel.WINDOW_NAME)
+                    panel_visible = False
+                    tuning_panel = None
+        if key == ord("t") and dashboard_visible:
             panel_visible = not panel_visible
             if panel_visible:
                 # Trackbars live in the Tuning Panel window and write

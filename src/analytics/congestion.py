@@ -1,38 +1,42 @@
 """
 src/analytics/congestion.py
 
-Module IV — Spatial Congestion / Density Analysis.
+Module IV — Congestion Analysis (STOPPED-vehicle based).
 
-Unlike stationary.py and wrong_way.py, this module needs NO time
-persistence at all — it's a per-frame SNAPSHOT question: "how many
-vehicles are currently, visibly, inside the ROI right now?" Not "has
-this been true for N seconds."
+LOGIC CHANGE (v2): congestion is no longer "how many vehicles are
+visible inside the ROI right now" — a busy but free-flowing road is
+NOT congestion. Congestion now means TRAFFIC HAS STOPPED MOVING:
 
-DESIGN DECISION: loops over get_active_ids(), NOT tracks.keys() (the
-opposite choice from stationary/wrong_way). Counting an occluded
-vehicle risks double-counting or counting a car that's already left
-frame — for a snapshot count, we only trust what's currently visible.
+    A vehicle counts toward congestion only if it has been STOPPED
+    (centroid barely moved) for at least
+    CONGESTION_STOPPED_DURATION_SEC continuous seconds while inside
+    the ROI. When the number of such stopped vehicles exceeds
+    CONGESTION_CAPACITY, a congestion event fires (rising edge only,
+    with the usual cooldown).
 
-LIVE TUNING: CONGESTION_CAPACITY is read from the shared LiveConfig
+This reuses the exact same sliding-window movement test proven in
+stationary.py (max centroid displacement over a time window), but with
+its OWN duration/pixel thresholds — congestion should react FASTER
+than the stationary module (a queue forming for 3 seconds is
+congestion; a single car parked for 5+ seconds is a stationary
+incident). Both sets of thresholds are live-tunable via LiveConfig.
+
+DESIGN DECISION: loops over tracks.keys(), NOT get_active_ids() —
+the OPPOSITE of the old snapshot logic, and the SAME choice as
+stationary.py, for the same reason: a stopped car briefly occluded by
+a passing truck is still stopped. Its history is untouched either way;
+we must not let one missed detection frame reset a queue count.
+
+LIVE TUNING: CONGESTION_CAPACITY, CONGESTION_STOPPED_DURATION_SEC and
+CONGESTION_STOPPED_PIXEL_THRESHOLD are read from the shared LiveConfig
 object (self.config) fresh every check() call — see
 config/live_config.py.
 
-REFACTOR: point-in-polygon logic now lives in src/geometry.py, shared
-with wrong_way.py's per-zone checks, instead of being duplicated here.
-
-KNOWN LIMITATION: CONGESTION_ROI_POLYGON_NORM in thresholds.py is a
-PLACEHOLDER — a rough rectangle covering most of the frame, not an
-actual traced road boundary. It does not know where the real drivable
-surface is for any specific camera. Same category of limitation as
-wrong_way.py's zone polygons: this needs manual per-camera calibration
-in a real deployment (a human looking at a sample frame from the
-actual guest-house camera and tracing the real road edges as polygon
-points) before this module's counts are meaningfully accurate.
-Only VEHICLE_CLASSES (Car/Bike/Bus/Truck) are counted toward
-congestion — Person and Animal detections inside the ROI are
-deliberately ignored, since "congestion" here specifically means
-vehicle traffic density, not general crowd density (a different
-concept, not built here).
+KNOWN LIMITATION: CONGESTION_ROI_POLYGON_NORM in thresholds.py is
+traced against the current test footage — it still needs per-camera
+calibration in a real deployment (see tools/calibrate_zones.py).
+Only VEHICLE_CLASSES (Car/Bike/Bus/Truck) are counted — Person and
+Animal detections inside the ROI are deliberately ignored.
 """
 
 import time
@@ -50,9 +54,9 @@ class CongestionDetector:
         self.track_manager = track_manager
 
         # The SAME LiveConfig instance every other tunable module reads
-        # from. CONGESTION_CAPACITY is read fresh inside check() below,
-        # never cached here, so the tuning panel's slider takes effect
-        # immediately.
+        # from. All three congestion thresholds are read fresh inside
+        # check() below, never cached here, so the tuning panel's
+        # sliders take effect immediately.
         self.config = config
 
         # ROI polygon is stored NORMALIZED (0-1) in thresholds.py so it
@@ -70,39 +74,76 @@ class CongestionDetector:
         self.last_triggered = float("-inf")
 
         # Tracks whether we're currently inside a congestion episode.
-        # Starts False because no over-capacity frame has been seen yet.
+        # Starts False because no over-threshold frame has been seen yet.
         self.is_congested = False
+
+        # Most recent stopped-vehicle count — read by main.py's HUD so
+        # the dashboard can display "Stopped: N / cap" every frame
+        # without re-running the whole check.
+        self.last_stopped_count = 0
 
     def _get_centroid(self, bbox):
         """bbox is (x1, y1, x2, y2). Return (cx, cy) — the box's center."""
         x1, y1, x2, y2 = bbox
         return ((x1 + x2) / 2, (y1 + y2) / 2)
 
+    def _distance(self, p1, p2):
+        """Straight-line distance between two (x, y) points."""
+        x1, y1 = p1
+        x2, y2 = p2
+        return ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+
+    def _is_stopped(self, history, timestamp, stopped_duration_sec, pixel_threshold):
+        """
+        Same sliding-window movement test as stationary.py, with
+        congestion's own (shorter) duration: keep only history entries
+        from the last stopped_duration_sec seconds, require the window
+        to actually span (most of) that duration, and require the
+        centroid never strayed more than pixel_threshold from where the
+        window started.
+        """
+        window = [
+            entry for entry in history
+            if timestamp - entry[0] <= stopped_duration_sec
+        ]
+
+        # Need at least 2 points to measure any movement at all.
+        if len(window) < 2:
+            return False
+
+        # The OLDEST point must be close to the full duration old — a
+        # car that entered frame one second ago can't yet prove it's
+        # been stopped for three. The *0.9 grace matches stationary.py.
+        if (timestamp - window[0][0]) < stopped_duration_sec * 0.9:
+            return False
+
+        centroids = [self._get_centroid(entry[1]) for entry in window]
+        max_distance = max(
+            self._distance(centroids[0], c) for c in centroids
+        )
+        return max_distance <= pixel_threshold
+
     def check(self, timestamp=None):
         """
         Call once per frame. Returns a list with ZERO or ONE event dict:
-            [{"count": int, "capacity": int, "timestamp": float}]
+            [{"stopped_count": int, "capacity": int,
+              "stopped_duration_sec": float, "timestamp": float}]
         """
         if timestamp is None:
             timestamp = time.time()
 
-        # Read the live-tunable capacity once per call, consistent with
+        # Read every live-tunable value once per call, consistent with
         # the pattern used in every other module.
         congestion_capacity = self.config.CONGESTION_CAPACITY
+        stopped_duration_sec = self.config.CONGESTION_STOPPED_DURATION_SEC
+        pixel_threshold = self.config.CONGESTION_STOPPED_PIXEL_THRESHOLD
 
-        # get_active_ids(), not tracks.keys() — deliberately the
-        # OPPOSITE choice from stationary/wrong_way. We only trust
-        # vehicles currently, visibly detected — not ones sitting in
-        # the occlusion buffer that might have already left frame.
-        #
-        # Must pass the SAME timestamp through, so it's compared
-        # consistently against last_seen values, not against real
-        # wall-clock time.
-        active_ids = self.track_manager.get_active_ids(timestamp)
+        stopped_count = 0
 
-        count = 0
-
-        for track_id in active_ids:
+        # tracks.keys(), not get_active_ids() — a stopped car briefly
+        # occluded by a passing truck is still stopped; don't let one
+        # missed detection frame reset the queue count.
+        for track_id in list(self.track_manager.tracks.keys()):
             info = self.track_manager.tracks[track_id]
 
             # Only vehicles count toward congestion — not people,
@@ -110,30 +151,44 @@ class CongestionDetector:
             if info["class_name"] not in VEHICLE_CLASSES:
                 continue
 
-            # Most recent known position for this vehicle.
-            centroid = self._get_centroid(info["history"][-1][1])
+            history = info["history"]
+            if not history:
+                continue
 
-            if point_in_polygon(centroid, self.roi_polygon):
-                count += 1
+            # Most recent known position must be inside the ROI —
+            # a car stopped in a driveway outside the road area is
+            # not road congestion.
+            centroid = self._get_centroid(history[-1][1])
+            if not point_in_polygon(centroid, self.roi_polygon):
+                continue
+
+            # THE new core test: has this vehicle been genuinely
+            # stopped for the whole congestion window?
+            if self._is_stopped(history, timestamp, stopped_duration_sec, pixel_threshold):
+                stopped_count += 1
+
+        self.last_stopped_count = stopped_count
 
         events = []
-        currently_over = count > congestion_capacity
+        currently_over = stopped_count > congestion_capacity
 
-        # Rising edge only: fire when the ROI transitions from normal to
-        # congested. While the episode remains active, suppress repeats.
+        # Rising edge only: fire when the ROI transitions from flowing
+        # to congested. While the episode remains active, suppress repeats.
         if currently_over and not self.is_congested:
             if timestamp - self.last_triggered >= EVENT_COOLDOWN_SEC:
                 event = {
-                    "count": count,
+                    "stopped_count": stopped_count,
                     "capacity": congestion_capacity,
+                    "stopped_duration_sec": stopped_duration_sec,
                     "timestamp": timestamp,
                 }
                 events.append(event)
                 self.last_triggered = timestamp
             self.is_congested = True
 
-        # Falling edge: once count returns to capacity or below, reset so
-        # the next rise can trigger a fresh event.
+        # Falling edge: once enough stopped vehicles start moving again
+        # (count back at/below threshold), reset so the next rise can
+        # trigger a fresh event.
         elif not currently_over and self.is_congested:
             self.is_congested = False
 

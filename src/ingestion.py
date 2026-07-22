@@ -1,4 +1,33 @@
+"""
+src/ingestion.py
+
+Threaded video ingestion with TWO deliberately different delivery modes:
+
+1. LOCAL FILE  -> LOSSLESS QUEUE. Every single frame of the file is
+   delivered to the main loop exactly once, in order — NOTHING is ever
+   dropped. If YOLO inference runs slower than the file's FPS, the
+   reader thread simply blocks and waits (a file has no "real time" to
+   fall behind — it's just bytes on disk). Each frame is delivered
+   together with its PTS (presentation timestamp = frame_index / fps,
+   i.e. VIDEO time, not wall-clock time), so every downstream module —
+   analytics windows, the event recorder's pre/post buffers, and the
+   saved MP4 clips — measures time in the video's own clock. This is
+   what makes recorded event clips come out at the source's EXACT fps
+   with zero skipped frames, no matter how slow the processing machine is.
+
+2. WEBCAM / RTSP -> LATEST-FRAME MODE BY DEFAULT. A live camera cannot
+   be paused, so if YOLO processing falls behind, the dashboard uses the
+   newest frame instead of waiting through old frames. This keeps the
+   dashboard playing at normal real-time speed. Timestamps here are real
+   wall-clock time.
+
+read() therefore now returns a (frame, timestamp) PAIR in both modes
+(or (None, None) when nothing is available), so main.py can use ONE
+consistent clock for everything downstream.
+"""
+
 import os
+import queue
 import sys
 import threading
 import time
@@ -11,9 +40,15 @@ if PROJECT_ROOT not in sys.path:
 
 from config.thresholds import RECONNECT_MAX_RETRIES, RECONNECT_DELAY_SEC, DEFAULT_FPS
 
+# How many decoded-but-not-yet-consumed frames the file queue may hold.
+# Big enough to smooth out momentary slowdowns (a single slow YOLO
+# frame), small enough that memory stays bounded (~64 frames of 720p
+# BGR is ~170 MB worst case at 1080p — acceptable, and usually far less).
+FILE_QUEUE_MAX_FRAMES = 64
+
 
 class VideoIngestion:
-    def __init__(self, source, loop_file=True):
+    def __init__(self, source, loop_file=True, drop_live_frames=True):
         """
         source: int (webcam index), or str (file path OR rtsp:// / http:// URL)
         loop_file: if True, local video files restart from frame 0 on EOF
@@ -25,40 +60,53 @@ class VideoIngestion:
         # if True, when a local video file ends, we restart it from the
         # beginning instead of stopping. Just a setting we remember.
         self.loop_file = loop_file
+        self.drop_live_frames = drop_live_frames
 
         # Normalize common protocol typos so malformed RTSP URLs still open.
         self.source = self._normalize_source(source)
 
-        # this is True/False — is this an RTSP camera link or not?
-        # isinstance(source, str) checks "is this a string?"
-        # .startswith("rtsp://") checks if the string begins with rtsp://
-        # both must be true for is_rtsp to be True
-        self.is_rtsp = isinstance(self.source, str) and self.source.startswith("rtsp://")  
+        # is this an RTSP camera link or not?
+        self.is_rtsp = isinstance(self.source, str) and self.source.startswith("rtsp://")
 
         # True only for local video files — NOT webcam (int) and NOT rtsp.
-        # We need this to know whether "loop_file" should even apply.
-        self.is_file = isinstance(self.source, str) and not self.is_rtsp      
+        self.is_file = isinstance(self.source, str) and not self.is_rtsp
 
         # self.cap will hold the actual OpenCV camera/video object once opened.
-        # None means "not opened yet"
         self.cap = None
 
-        # self.frame is our "whiteboard" — the latest frame, shared between
-        # the background thread and the main program. Starts empty.
-        self.frame = None           # the shared "latest frame" buffer
+        # ── LIVE latest-frame mode state: the "latest frame" whiteboard ──
+        self.frame = None
+        self.lock = threading.Lock()
 
-        # the "lock" — the rule that only one thread touches self.frame at a time
-        self.lock = threading.Lock()  # protects self.frame from race conditions
+        # ── Ordered delivery queue ───────────────────────────────────────
+        # Each queue item is a (frame, pts_seconds) tuple. maxsize makes
+        # put() BLOCK when the consumer falls behind — that blocking IS
+        # the no-drop guarantee for files and smooth live mode: the reader
+        # waits instead of overwriting.
+        self.frame_queue = queue.Queue(maxsize=FILE_QUEUE_MAX_FRAMES)
+
+        # Monotonic count of frames successfully read from the file since
+        # start(). PTS = frames_read * frame_interval. NOT reset when the
+        # file loops — timestamps must keep increasing forever, or every
+        # time-window comparison downstream would see time run backwards.
+        self._frames_read = 0
 
         # a flag: is the background worker allowed to keep running?
-        # we flip this to False when we want everything to stop.
         self.running = False
 
-        # will hold the actual background worker (the Thread object) once started
-        self.thread = None  #The dedicated process that handles video capture independently.
-        # For local file playback pacing (None for webcam/RTSP)
+        # will hold the background reader Thread once started
+        self.thread = None
+
+        # The source's own frame rate. For files this is read from the
+        # container in _open_capture(); for live sources it stays None
+        # (many RTSP cameras lie about FPS anyway). Exposed publicly so
+        # main.py can display it and compare against measured FPS.
+        self.source_fps = None
         self.source_frame_interval = None
-        # Wall-clock time of the last successful read (used only for local files)
+
+        # Wall-clock time of the last successful file read — used only to
+        # pace file playback down to real time when processing is FASTER
+        # than the source FPS (so the dashboard doesn't fast-forward).
         self._last_read_time = None
 
     @staticmethod
@@ -70,36 +118,24 @@ class VideoIngestion:
             return normalized
         return source
 
-    
     def _open_capture(self):
         """Opens (or re-opens) the underlying cv2.VideoCapture."""
-        
-        #Check if we are dealing with a live network camera (RTSP)
-        if self.is_rtsp:
-            
-            # Force TCP transport instead of default UDP. 
-            # UDP is fast but drops packets, which causes gray, smudged 
-            # artifacts in the video. TCP ensures every pixel arrives intact.
 
-            # os.environ allows our Python script to set a temporary environment variable for the operating system.
-            # "OPENCV_FFMPEG_CAPTURE_OPTIONS" is a specific setting name. It tells OpenCV's internal video reader (which is powered by FFMPEG) to listen for special instructions.
-            # "rtsp_transport;tcp" is the actual instruction. It forces the camera's video stream to travel over the TCP network protocol instead of the default UDP protocol.
+        if self.is_rtsp:
+            # Force TCP transport instead of default UDP — UDP drops
+            # packets, which causes gray smudged artifacts in the video.
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-            
-            # Open the stream. We explicitly tell OpenCV to use the FFMPEG 
-            # backend because it handles network streams much better than the defaults.
             cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
-            
         else:
-            #For local webcams (0) or .mp4 files, just open
-            #  it normally.
+            # local webcams (0) or .mp4 files open normally
             cap = cv2.VideoCapture(self.source)
 
-        # Safety check: Did the camera or file actually open successfully?
-        # If not, crash loudly and tell us why, rather than failing silently later.
         if not cap.isOpened():
             raise RuntimeError(f"Could not open source: {self.source}")
-        # For local files, read the file's FPS and compute the per-frame interval
+
+        # For local files, read the file's FPS once and derive the
+        # per-frame interval — this drives BOTH the PTS timestamps and
+        # the real-time pacing below.
         if self.is_file:
             fps = cap.get(cv2.CAP_PROP_FPS)
             try:
@@ -107,167 +143,204 @@ class VideoIngestion:
             except Exception:
                 fps_val = 0.0
 
-            if fps_val and fps_val > 0:
-                self.source_frame_interval = 1.0 / fps_val
-            else:
-                self.source_frame_interval = 1.0 / DEFAULT_FPS
-        else:
-            # For webcam or RTSP streams, do not throttle
-            self.source_frame_interval = None
+            if not (fps_val and fps_val > 0):
+                fps_val = float(DEFAULT_FPS)
 
-        # Hand back the successfully opened video object
+            self.source_fps = fps_val
+            self.source_frame_interval = 1.0 / fps_val
+        else:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            try:
+                fps_val = float(fps)
+            except Exception:
+                fps_val = 0.0
+
+            if not (fps_val and fps_val > 0):
+                fps_val = float(DEFAULT_FPS)
+
+            self.source_fps = fps_val
+            self.source_frame_interval = 1.0 / fps_val
+
         return cap
 
     def start(self):
         """Opens the capture and starts the background reader thread."""
-
-        # Call our helper method to establish the actual connection to the camera/file
         self.cap = self._open_capture()
-
-        # Set our control flag to True. The while loop in _update will run as long as this is True.
         self.running = True
 
-        # set it as a daemon thread (so it dies automatically if the main
-        # program exits unexpectedly). This is a safety measure to prevent zombie threads.
-
-        # Create a new background worker. We tell it exactly which function to run 
-        # by passing target=self._update (notice there are no parentheses after _update, 
-        # because we are handing the function itself to the thread, not running it yet).
+        # Daemon thread: dies automatically with the main program, so a
+        # crash can never leave a zombie reader behind.
         self.thread = threading.Thread(target=self._update)
-
-        # Mark this thread as a daemon. This ties its lifespan to the main program.
-        # If the main program stops or crashes, the operating system will automatically 
-        # kill this background thread so it doesn't become a zombie process.
         self.thread.daemon = True
-
-        # Actually turn the thread on. This causes the _update() loop to begin executing 
-        # simultaneously alongside our main program.
         self.thread.start()
-
-        # Returning 'self' is a convenience that allows chaining method calls later.
         return self
-    
-    def _update(self):
-        """
-        Runs forever in the background thread. Reads frames as fast as
-        possible and overwrites self.frame.
-        """
-        # Keep track of how many times we've failed to read a frame in a row
-        retries = 0
-        
-        # 'while self.running:' means "keep doing this indented block of code 
-        # forever, until someone changes self.running to False"
-        while self.running:
-            
-            # Try to grab the next picture from the camera/file.
-            # 'ret' will be True if successful, False if it failed/ended.
-            # 'frame' holds the actual image pixels (if successful).
-            ret, frame = self.cap.read()
-            
-            # 'if not ret:' means "if reading the frame failed"
-            if not ret:
 
-                # NEW: if this is a local file, it reached its end, AND the
-                # caller explicitly asked us NOT to loop it — stop cleanly
-                # instead of reconnecting. This is the only place loop_file
-                # actually gets checked/used.
+    # ─────────────────────── background reader ───────────────────────
+
+    def _update(self):
+        """Runs in the background thread until stop() flips self.running."""
+        retries = 0
+
+        while self.running:
+            ret, frame = self.cap.read()
+
+            if not ret:
+                # Local file reached its end and the caller asked NOT to
+                # loop — stop cleanly instead of reconnecting.
                 if self.is_file and not self.loop_file:
                     self.running = False
-                    break   
-                
-                retries += 1  # Add 1 to our failure counter
-                
-                # Have we failed too many times? (e.g., more than 5 times)
+                    break
+
+                if self.is_file and self.loop_file:
+                    # EOF on a looping file: seek back to frame 0 and keep
+                    # going. IMPORTANT: _frames_read is NOT reset — PTS
+                    # must stay monotonically increasing across loops.
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+
+                retries += 1
                 if retries > RECONNECT_MAX_RETRIES:
-                    self.running = False  # Give up, tell the loop to stop
-                    break                 # 'break' forces us to exit the 'while' loop completely
-                
-                # Wait a moment (e.g., 1 second) before trying again
-                time.sleep(RECONNECT_DELAY_SEC) 
-                
-                # Close the broken connection and try opening it again.
-                # Wrapped in try/except: _open_capture() raises RuntimeError
-                # immediately if the source is genuinely unreachable (e.g.
-                # RTSP still down). Without this catch, that exception used
-                # to kill this whole background thread on the FIRST failed
-                # reconnect attempt, bypassing RECONNECT_MAX_RETRIES entirely.
-                # Catching it here lets the retry counter above actually do
-                # its job across multiple attempts, same as originally intended.
+                    self.running = False
+                    break
+
+                time.sleep(RECONNECT_DELAY_SEC)
+
+                # try/except: _open_capture raises immediately if the
+                # source is still unreachable — without catching, one
+                # failed reconnect would kill this whole thread and
+                # bypass RECONNECT_MAX_RETRIES entirely.
                 self.cap.release()
                 try:
                     self.cap = self._open_capture()
                 except RuntimeError:
                     continue
-                
                 continue
-                
-            # If we get here, we successfully got a frame!
-            else:
-                retries = 0  # Reset our failure counter back to 0
-                # Throttle local file playback to the source video's own FPS
-                if self.source_frame_interval is not None:
-                    now = time.time()
-                    if self._last_read_time is not None:
-                        elapsed = now - self._last_read_time
-                        remaining = self.source_frame_interval - elapsed
-                        if remaining > 0:
-                            time.sleep(remaining)
-                    # Update last read time after possible sleep
-                    self._last_read_time = time.time()
 
-                # Use the lock. This says "Hey main program, don't read the 
-                # whiteboard while I am currently erasing and redrawing it!"
+            # ── successful read ──
+            retries = 0
+
+            if self.is_file:
+                self._deliver_file_frame(frame)
+            elif self.drop_live_frames:
+                # live source: overwrite the whiteboard, dropping any
+                # frame the consumer didn't get to in time — correct
+                # when minimum latency matters more than smooth output.
                 with self.lock:
-                    self.frame = frame  # Update the shared whiteboard with the new picture
+                    self.frame = frame
+            else:
+                self._deliver_live_frame(frame)
 
+    def _deliver_file_frame(self, frame):
+        """
+        FILE mode delivery: push (frame, pts) onto the lossless queue.
+
+        Two pacing forces act here, covering both speed mismatches:
+        - consumer FASTER than source fps -> the sleep below throttles
+          reading down to real time, so playback speed stays correct;
+        - consumer SLOWER than source fps -> queue.put() blocks when the
+          queue is full, so the reader WAITS instead of overwriting.
+          Zero frames dropped either way.
+        """
+        # Video-time timestamp for this frame, BEFORE incrementing:
+        # frame 0 gets pts 0.0, frame 1 gets one interval, and so on.
+        pts = self._frames_read * self.source_frame_interval
+        self._frames_read += 1
+
+        # Real-time pacing (only matters when we're reading faster than
+        # the source fps — e.g. GPU inference breezing through a file).
+        now = time.time()
+        if self._last_read_time is not None:
+            remaining = self.source_frame_interval - (now - self._last_read_time)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last_read_time = time.time()
+
+        # Blocking put with a short timeout in a loop, NOT a bare
+        # put(): if stop() flips self.running while the queue is full,
+        # a bare blocking put would deadlock this thread forever.
+        while self.running:
+            try:
+                self.frame_queue.put((frame, pts), timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def _deliver_live_frame(self, frame):
+        """
+        Smooth live delivery: enqueue decoded frames in order with a
+        wall-clock timestamp from the moment the frame reached the app.
+        """
+        timestamp = time.time()
+        while self.running:
+            try:
+                self.frame_queue.put((frame, timestamp), timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    # ───────────────────────── consumer side ─────────────────────────
 
     def read(self):
         """
-        Consumer-facing method. Returns the most recent frame (or None if
-        nothing's available yet / stream has stopped). NEVER blocks.
+        Consumer-facing method. Returns (frame, timestamp):
+
+        - FILE mode:  the NEXT unseen frame in order + its video-time
+          PTS in seconds. Lossless — every frame comes through exactly
+          once. Waits up to ~10ms for one to arrive, then gives up with
+          (None, None) so the caller's loop never hard-blocks.
+        - LIVE default mode: the newest frame + wall-clock time.time().
+        - LIVE smooth mode, if drop_live_frames=False: the next decoded
+          live frame in order + wall-clock timestamp.
+        - (None, None) when nothing is available / the stream stopped.
         """
-        # Use the lock here too — same rule as before: don't touch the
-        # whiteboard while someone else might be mid-write to it.
+        if self.is_file or not self.drop_live_frames:
+            try:
+                # Short timeout instead of get_nowait(): yields the CPU
+                # while waiting, so main.py's retry-continue loop doesn't
+                # spin at 100% between frames.
+                return self.frame_queue.get(timeout=0.01)
+            except queue.Empty:
+                # Distinguish "reader finished AND queue fully drained"
+                # (stream truly over -> None forever) from "reader alive,
+                # next frame just not decoded yet" (transient None).
+                return (None, None)
+
+        # Low-latency live mode — same semantics as before, plus a timestamp
         with self.lock:
-
-            # If the background thread has given up entirely (retries
-            # exhausted, self.running flipped False), stop handing out
-            # the last cached frame as if it were still live — that
-            # silently freezes analytics on a still image forever,
-            # which looks to every downstream module like every vehicle
-            # in frame simultaneously stopped moving.
             if not self.running or self.frame is None:
-                return None
+                # Once the background thread has given up, stop handing
+                # out the last cached frame as if it were live — that
+                # would freeze analytics on a still image forever.
+                return (None, None)
+            return (self.frame.copy(), time.time())
 
-            # .copy() creates a brand new, separate block of memory with
-            # the same pixel data — NOT a reference to the same object.
-            return self.frame.copy()
+    def is_finished(self):
+        """
+        True once the source is definitively over: the reader thread has
+        stopped AND (for files) every queued frame has been consumed.
+        Lets main.py exit cleanly at EOF instead of spinning forever.
+        """
+        if self.running:
+            return False
+        if self.is_file:
+            return self.frame_queue.empty()
+        return True
 
     def stop(self):
         """Cleanly shuts down the background thread and releases the capture."""
-
-        # Flip the flag. The _update() loop checks "while self.running:"
-        # on every iteration, so on its NEXT loop pass it'll see this is
-        # False and exit on its own. We don't forcibly kill it — we ask
-        # nicely and wait.
         self.running = False
 
-        # .join() means: "pause HERE in the main program, and don't move
-        # on to the next line, until that background thread has actually
-        # finished and exited." Without this, we might try to release the
-        # camera while the background thread is still mid-read() on it —
-        # a race condition that can crash or hang.
+        # Wait for the reader thread to actually exit before touching
+        # self.cap — releasing mid-read is a race that can crash or hang.
+        # (The reader can't deadlock on a full queue: _deliver_file_frame
+        # re-checks self.running every 0.1s while trying to put.)
         if self.thread is not None:
             self.thread.join()
 
-        # Now that we're sure the background thread is fully stopped,
-        # it's safe to release the camera/file handle.
         if self.cap is not None:
             self.cap.release()
 
-
-    # Optional but good practice: context manager support so callers can do
-    # `with VideoIngestion(source) as cap:`
+    # Context manager support: `with VideoIngestion(source) as cap:`
     def __enter__(self):
         return self.start()
 

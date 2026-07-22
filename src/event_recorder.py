@@ -96,7 +96,10 @@ class EventRecorder:
         module = event_type  # now the module name: stationary/wrong_way/hazard/congestion
         class_name = metadata.get("class_name", "unknown")
         track_id_str = metadata.get("id", "NA")
-        readable_time = datetime.fromtimestamp(timestamp).strftime("%H%M%S_%f")[:-3]
+        # Event math uses the caller's timestamp, which is video PTS for
+        # files. Filenames should stay human-readable wall-clock time.
+        wall_time = datetime.now()
+        readable_time = wall_time.strftime("%H%M%S_%f")[:-3]
 
         event_id = f"{module}_{class_name}_id{track_id_str}_{readable_time}"
         filename = f"{event_id}.jpg"
@@ -105,7 +108,8 @@ class EventRecorder:
         extra = {k: v for k, v in metadata.items() if k not in ("class_name", "id")}
         print(
             f"[EVENT TRIGGERED] id={event_id} | module={module} | class={class_name} "
-            f"| track_id={track_id_str} | time={datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')} "
+            f"| track_id={track_id_str} | time={wall_time.strftime('%H:%M:%S')} "
+            f"| video_ts={timestamp:.3f}s "
             f"| meta={extra}"
         )
 
@@ -134,7 +138,12 @@ class EventRecorder:
             return
 
         duration = all_frames[-1][0] - all_frames[0][0]
-        fps = len(all_frames) / duration if duration > 0 else 20
+        # (N frames span N-1 intervals, so fps = (N-1)/duration, NOT
+        # N/duration — the off-by-one would make every saved clip play
+        # slightly fast. With the ingestion layer's PTS timestamps the
+        # frames are exactly 1/source_fps apart, so this now recovers
+        # the source's EXACT fps.)
+        fps = (len(all_frames) - 1) / duration if duration > 0 else 20
 
         height, width = all_frames[0][1].shape[:2]
         path = os.path.join(self.output_dir, entry["event_id"] + ".mp4")
