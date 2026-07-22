@@ -1,9 +1,9 @@
 # Real-Time YOLOv8 Traffic Monitoring System
 
 **Author:** Yuvraj Tak | **Internship:** AI/ML Intern, Watsoo Express Pvt. Ltd.
-**Mentor:** Ankit Gupta | **Repo:** github.com/Yuvrajtakk/Traffic_Analysis_YOLO_project
+**Mentor:** Ankit Gupta 
 
-## TL;DR — Read This If You're Short on Time
+## Read This If You're Short on Time
 
 A real-time traffic monitoring pipeline: a custom-trained 10-class
 YOLOv8s detector + ByteTrack tracking, feeding four independent
@@ -73,7 +73,7 @@ needed to actually run and evaluate the project.
 
 # The Full Development Journal
 
-This is the real story of how this project got built — not the cleaned-up version. I'm writing it in chronological phases, pulling the actual numbers, filenames, and decisions from my own conversation history as I worked through it. Where something was genuinely unclear or showed up differently in two different sessions, I flagged it with **❓** instead of quietly picking one version — those have since been resolved and folded in below; see the note at the very end.
+This is the real story of how this project got built — not the cleaned-up version. I'm writing it in chronological phases, pulling the actual numbers, filenames, and decisions from my own conversation history as I worked through it.
 
 ---
 
@@ -205,9 +205,9 @@ Colab's free tier caps a session at roughly 4–5 hours before disconnecting. Th
 ### The checkpoint-chaos saga
 This is the part of the story that cost the most real hours, and it's worth telling straight rather than smoothing over.
 
-Training bounced across a string of Google accounts as each one's Colab compute ran out — named in the transcripts I have: the original owner **takcommunity99**, then **yuvrajtak651**, then a third account, **imuv**. Across the full saga (including the later stretch finishing epoch 74 → 100), the real total was closer to **~5 account switches**, not just the three named above.
+Training bounced across a string of Google accounts as each one's Colab compute ran out — named in the transcripts. Across the full saga (including the later stretch finishing epoch 74 → 100), the real total was closer to **~5 account switches**, not just the three named above.
 
-The `yuvrajtak651` run was the good one — it went the full stretch from epoch 23 to 49 with **zero disconnects**, climbing cleanly the whole way:
+The full stretch from epoch 23 to 49 with **zero disconnects**, climbing cleanly the whole way:
 
 | Epoch | mAP50 | mAP50-95 |
 |---|---:|---:|
@@ -217,10 +217,6 @@ The `yuvrajtak651` run was the good one — it went the full stretch from epoch 
 | 48 | 0.710 | 0.436 |
 
 It died mid-epoch 49 (511 of 937 batches in), with `patience=30` never even close to triggering — still gaining every few epochs.
-
-Then the actual chaos: switching to the third account (`imuv`), I mounted Drive, checked for `last.pt` at the expected path, found it, and resumed — except training restarted from **epoch 21**, not 48. The root cause turned out to be two separate Drive folder objects that looked interchangeable but weren't: a standalone `v2_960_100epoch_real` folder shared directly at 2:49 PM (the real one, from `yuvrajtak651`'s clean run), and a different, nested `v2_960_100epoch_real` folder living inside a shared `traffic_project` folder from `takcommunity99`, shared later at 8:25 PM — and stuck around epoch 20. I'd resumed from the wrong one. In my own words at the time: *"i have traverse all the folder but couldn't find epoches more than 20... please help me?? i wasted so many hours and energy."*
-
-The actual fix was to stop manually browsing folders and **search Drive by filename** directly (`last.pt`, `epoch45.pt`) instead — that's what surfaced the real folder, still sitting on the `yuvrajtak651` account, containing checkpoints from epoch 25 through 45. I shared it fresh to `imuv`, renamed the new shortcut to avoid yet another name collision, and — critically — verified the *real* latest checkpoint by running `os.listdir()` on the weights folder and reading the actual epoch-numbered filenames present, rather than trusting any `last.pt` file's modified timestamp (mtimes proved unreliable across shared-Drive, multi-account contexts). That became a locked-in rule for the rest of the project: **always confirm via `os.listdir()`, never trust `last.pt`'s mtime.**
 
 ### Final metrics
 The 100-epoch run on the rebuilt v2/10-class dataset finished cleanly — 100/100 epochs, no more checkpoint hunting needed. Final overall: **mAP50 = 0.721**, **mAP50-95 = 0.452**.
